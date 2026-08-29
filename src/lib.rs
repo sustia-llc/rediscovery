@@ -5,6 +5,7 @@
 pub mod error;
 pub mod graph;
 pub mod logger;
+pub mod node2vec;
 pub mod settings;
 pub mod spectral;
 

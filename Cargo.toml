@@ -17,3 +17,12 @@ config = "0.15"
 serde = { version = "1", features = ["derive"] }
 rand = "0.10"
 rand_chacha = "0.10"
+
+# Tier-1 pins drive 10^4 full-batch steps of dense n×m linear algebra per
+# graph; `cargo test` inherits this profile, so the dependency stack that does
+# that arithmetic is optimized while crate code keeps debug assertions.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
