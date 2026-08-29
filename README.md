@@ -15,9 +15,16 @@ Node2Vec model (right). The right two columns are what this POC replicates.*
 
 ## Status
 
-Library-first scaffold. `graph` and `spectral` are module stubs for Tier 0
-(graph construction, Laplacian/eigendecomposition) — no numerics implemented
-yet.
+Tier 0 is implemented: `graph` builds the paper's tiny topologies (path-star,
+grid, cycle, irregular, tree-star, complete) over dense nalgebra adjacency,
+and `spectral` provides the row-normalized transition matrix D⁻¹A, the
+random-walk Laplacian L = (I − D⁻¹A) + (I − D⁻¹A)ᵀ, and `Spectrum` — the
+eigendecomposition of −L with descending order, a deterministic sign
+convention, and degenerate-group detection. Closed-form pins (15-cycle,
+complete graphs) and property pins run in-module; public-seam integration
+tests live in `tests/`. Tiers 1–2 (Node2Vec dynamics, TinyNN competition)
+are next; decision labels D1–D10 are recorded in
+[`docs/2510.26745v2-poc-analysis.md`](docs/2510.26745v2-poc-analysis.md) §8.
 
 `subsystems::runner` is the async task lifecycle core: a `Runner` owns a
 `TaskTracker` + `CancellationToken`, exposes `cancellation_token()`, and

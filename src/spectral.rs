@@ -1,13 +1,12 @@
 //! Spectral infrastructure for Tier 0 of the POC.
 //!
-//! [`laplacian`] builds the asymmetrically normalized random-walk Laplacian
-//! L = (I − D⁻¹A) + (I − D⁻¹A)ᵀ of Appendix F from a [`Graph`], and
-//! [`Spectrum`] holds the symmetric eigendecomposition of −L with the
-//! deterministic ordering and sign convention of decision D5: eigenpairs
-//! descending by eigenvalue, and each eigenvector scaled so that its first
-//! component of magnitude above [`SIGN_PIVOT_TOLERANCE`] is positive. All
-//! arithmetic is f64. Everything downstream that reasons about eigenvector
-//! alignment (Tier 1's `Node2Vec` dynamics) consumes this.
+//! [`transition`] builds the row-normalized walk matrix D⁻¹A, [`laplacian`]
+//! the asymmetrically normalized random-walk Laplacian
+//! L = (I − D⁻¹A) + (I − D⁻¹A)ᵀ of Appendix F, and [`Spectrum`] holds the
+//! symmetric eigendecomposition of −L with the deterministic ordering and
+//! sign convention of decision D5 (`docs/2510.26745v2-poc-analysis.md` §8).
+//! All arithmetic is f64. Everything downstream that reasons about
+//! eigenvector alignment (Tier 1's `Node2Vec` dynamics) consumes this.
 
 use nalgebra::{DMatrix, DVector, linalg::SymmetricEigen};
 
@@ -18,18 +17,13 @@ use crate::graph::Graph;
 /// eigenvector's sign (decision D5).
 pub const SIGN_PIVOT_TOLERANCE: f64 = 1e-9;
 
-/// Computes L = (I − D⁻¹A) + (I − D⁻¹A)ᵀ for `graph`.
-///
-/// The summand I − D⁻¹A is not symmetric on an irregular graph; the returned
-/// L is, being of the form X + Xᵀ.
+/// Computes the row-normalized transition matrix W = D⁻¹A for `graph`.
 ///
 /// # Errors
 ///
 /// Returns [`Error::IsolatedVertex`] for a degree-zero vertex, where D⁻¹
 /// does not exist.
-pub fn laplacian(graph: &Graph) -> Result<DMatrix<f64>> {
-    let order = graph.order();
-
+pub fn transition(graph: &Graph) -> Result<DMatrix<f64>> {
     if let Some((vertex, _)) = graph
         .degrees()
         .iter()
@@ -39,13 +33,31 @@ pub fn laplacian(graph: &Graph) -> Result<DMatrix<f64>> {
         return Err(Error::IsolatedVertex { vertex });
     }
 
-    let mut transition = graph.adjacency().clone();
-    for (vertex, mut row) in transition.row_iter_mut().enumerate() {
+    let mut walk = graph.adjacency().clone();
+    for (vertex, mut row) in walk.row_iter_mut().enumerate() {
         row /= graph.degrees()[vertex];
     }
+    Ok(walk)
+}
 
-    let deviation = DMatrix::<f64>::identity(order, order) - transition;
-    Ok(&deviation + deviation.transpose())
+/// Computes X + Xᵀ, the symmetric part of `matrix` scaled by two.
+#[must_use]
+pub fn symmetrize(matrix: &DMatrix<f64>) -> DMatrix<f64> {
+    matrix + matrix.transpose()
+}
+
+/// Computes L = (I − D⁻¹A) + (I − D⁻¹A)ᵀ for `graph`.
+///
+/// The summand I − D⁻¹A is not symmetric on an irregular graph; the returned
+/// L is, being of the form X + Xᵀ.
+///
+/// # Errors
+///
+/// Propagates [`transition`]'s [`Error::IsolatedVertex`].
+pub fn laplacian(graph: &Graph) -> Result<DMatrix<f64>> {
+    let order = graph.order();
+    let deviation = DMatrix::<f64>::identity(order, order) - transition(graph)?;
+    Ok(symmetrize(&deviation))
 }
 
 /// The eigendecomposition of a symmetric matrix, ordered and sign-fixed per
@@ -53,7 +65,11 @@ pub fn laplacian(graph: &Graph) -> Result<DMatrix<f64>> {
 ///
 /// Eigenvalues descend; eigenvector `j` is column `j` of
 /// [`Spectrum::eigenvectors`], is unit-norm, and has a positive first
-/// component of magnitude above [`SIGN_PIVOT_TOLERANCE`].
+/// component of magnitude above [`SIGN_PIVOT_TOLERANCE`]. Within a group of
+/// equal eigenvalues (see [`Spectrum::degenerate_groups`]) the columns are
+/// one orthonormal basis of the group's eigenspace; only the span is
+/// determined, so cross-run comparisons over such groups must compare
+/// subspaces, not columns.
 #[derive(Debug, Clone)]
 pub struct Spectrum {
     eigenvalues: DVector<f64>,
@@ -64,36 +80,60 @@ impl Spectrum {
     /// Decomposes `symmetric`, then applies the D5 ordering and sign
     /// convention.
     ///
-    /// Only the lower triangle of `symmetric` (including its diagonal) is
-    /// read, so a non-symmetric argument is decomposed as though its upper
-    /// triangle mirrored its lower one; callers supply matrices of the form
-    /// X + Xᵀ.
-    ///
     /// # Errors
     ///
-    /// Returns [`Error::NotSquare`] for a non-square argument and
-    /// [`Error::EigenNotConverged`] if the symmetric QR iteration fails to
-    /// converge.
+    /// Returns [`Error::EmptyMatrix`] for a 0×0 argument,
+    /// [`Error::NotSquare`] for a non-square one, [`Error::NonFinite`] for a
+    /// NaN or infinite entry, and [`Error::NotSymmetric`] for entries whose
+    /// mirror differs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `SymmetricEigen::try_new` with `max_niter = 0` returns
+    /// `None`: nalgebra 0.35's iteration returns `None` only on reaching a
+    /// positive `max_niter` (`symmetric_eigen.rs:245-247`), and its own
+    /// `SymmetricEigen::new` unwraps the same call.
+    #[allow(
+        clippy::float_cmp,
+        reason = "callers build X + Xᵀ, which is bitwise symmetric; a tolerance would be an invented knob"
+    )]
     pub fn new(symmetric: DMatrix<f64>) -> Result<Self> {
         let (rows, columns) = symmetric.shape();
         if rows != columns {
             return Err(Error::NotSquare { rows, columns });
         }
+        if rows == 0 {
+            return Err(Error::EmptyMatrix);
+        }
+        for row in 0..rows {
+            for column in row..columns {
+                let entry = symmetric[(row, column)];
+                if !entry.is_finite() {
+                    return Err(Error::NonFinite { row, column });
+                }
+                let mirror = symmetric[(column, row)];
+                if !mirror.is_finite() {
+                    return Err(Error::NonFinite {
+                        row: column,
+                        column: row,
+                    });
+                }
+                if entry != mirror {
+                    return Err(Error::NotSymmetric { row, column });
+                }
+            }
+        }
 
-        // `max_niter == 0` means "iterate until convergence" in nalgebra.
-        let eigen = SymmetricEigen::try_new(symmetric, f64::EPSILON, 0)
-            .ok_or(Error::EigenNotConverged { order: rows })?;
+        let eigen = SymmetricEigen::try_new(symmetric, f64::EPSILON, 0).expect(
+            "invariant: max_niter = 0 iterates until convergence and never yields None \
+             (nalgebra 0.35 symmetric_eigen.rs:245-247)",
+        );
 
         let mut order: Vec<usize> = (0..rows).collect();
         order.sort_by(|&a, &b| eigen.eigenvalues[b].total_cmp(&eigen.eigenvalues[a]));
 
-        let eigenvalues = DVector::from_iterator(rows, order.iter().map(|&i| eigen.eigenvalues[i]));
-        let mut eigenvectors = DMatrix::<f64>::zeros(rows, rows);
-        for (target, &source) in order.iter().enumerate() {
-            eigenvectors
-                .column_mut(target)
-                .copy_from(&eigen.eigenvectors.column(source));
-        }
+        let eigenvalues = eigen.eigenvalues.select_rows(order.iter());
+        let mut eigenvectors = eigen.eigenvectors.select_columns(order.iter());
 
         for mut column in eigenvectors.column_iter_mut() {
             let pivot = column
@@ -118,7 +158,7 @@ impl Spectrum {
     /// # Errors
     ///
     /// Propagates [`laplacian`]'s [`Error::IsolatedVertex`] and
-    /// [`Spectrum::new`]'s [`Error::EigenNotConverged`].
+    /// [`Spectrum::new`]'s errors.
     pub fn of_negative_laplacian(graph: &Graph) -> Result<Self> {
         Self::new(-laplacian(graph)?)
     }
@@ -137,14 +177,29 @@ impl Spectrum {
 
     /// The number of eigenpairs, equal to the decomposed matrix's dimension.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub fn order(&self) -> usize {
         self.eigenvalues.len()
     }
 
-    /// Whether the decomposed matrix was 0×0.
+    /// Splits `0..order` into maximal runs of consecutive indices whose
+    /// adjacent eigenvalues differ by at most `gap_tolerance`, in the stored
+    /// descending order. Within a returned group the eigenvector columns are
+    /// one orthonormal basis of the group's eigenspace; assertions across
+    /// runs or labelings must compare the spans.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.eigenvalues.is_empty()
+    pub fn degenerate_groups(&self, gap_tolerance: f64) -> Vec<std::ops::Range<usize>> {
+        let order = self.order();
+        let mut groups = Vec::new();
+        let mut start = 0;
+        for end in 1..=order {
+            if end == order
+                || (self.eigenvalues[end - 1] - self.eigenvalues[end]).abs() > gap_tolerance
+            {
+                groups.push(start..end);
+                start = end;
+            }
+        }
+        groups
     }
 }
 
@@ -155,24 +210,26 @@ impl Spectrum {
 )]
 mod tests {
     use super::*;
+    use crate::graph::test_fixtures;
     use std::f64::consts::PI;
 
-    /// Every constructor, with the label used in failure messages.
-    fn fixtures() -> Vec<(&'static str, Graph)> {
-        vec![
-            (
-                "path_star(4,4)",
-                Graph::path_star(4, 4).expect("path_star(4,4)"),
-            ),
-            ("grid(4,4)", Graph::grid(4, 4).expect("grid(4,4)")),
-            ("cycle(15)", Graph::cycle(15).expect("cycle(15)")),
-            ("irregular()", Graph::irregular().expect("irregular()")),
-            (
-                "tree_star(3,3)",
-                Graph::tree_star(3, 3).expect("tree_star(3,3)"),
-            ),
-            ("complete(7)", Graph::complete(7).expect("complete(7)")),
-        ]
+    /// Tolerance for eigenvalues checked against closed forms.
+    const EIGENVALUE_TOLERANCE: f64 = 1e-9;
+    /// Tolerance for Frobenius residuals of exact matrix identities.
+    const RESIDUAL_TOLERANCE: f64 = 1e-10;
+
+    /// ‖`EᵀE` − I‖_F for a spectrum's eigenvector matrix.
+    fn orthonormality_residual(spectrum: &Spectrum) -> f64 {
+        let e = spectrum.eigenvectors();
+        let n = spectrum.order();
+        (e.transpose() * e - DMatrix::<f64>::identity(n, n)).norm()
+    }
+
+    /// ‖`EΛEᵀ` − target‖_F for a spectrum against the matrix it decomposed.
+    fn reconstruction_residual(spectrum: &Spectrum, target: &DMatrix<f64>) -> f64 {
+        let e = spectrum.eigenvectors();
+        let reconstruction = e * DMatrix::from_diagonal(spectrum.eigenvalues()) * e.transpose();
+        (&reconstruction - target).norm()
     }
 
     /// −L of the 15-cycle has the closed-form eigenvalues
@@ -190,9 +247,9 @@ mod tests {
         for (k, &want) in expected.iter().enumerate() {
             let got = spectrum.eigenvalues()[k];
             assert!(
-                (got - want).abs() < 1e-9,
+                (got - want).abs() < EIGENVALUE_TOLERANCE,
                 "cycle(15): eigenvalue {k} is {got:.15}, closed form gives {want:.15} \
-                 (|Δ| = {:.3e}, tolerance 1e-9)",
+                 (|Δ| = {:.3e}, tolerance {EIGENVALUE_TOLERANCE:e})",
                 (got - want).abs()
             );
         }
@@ -209,9 +266,9 @@ mod tests {
         let uniform = 1.0 / 15.0_f64.sqrt();
         for (vertex, &component) in top.iter().enumerate() {
             assert!(
-                (component - uniform).abs() < 1e-9,
+                (component - uniform).abs() < EIGENVALUE_TOLERANCE,
                 "cycle(15): top eigenvector component {vertex} is {component:.15}, \
-                 expected {uniform:.15} (|Δ| = {:.3e}, tolerance 1e-9)",
+                 expected {uniform:.15} (|Δ| = {:.3e}, tolerance {EIGENVALUE_TOLERANCE:e})",
                 (component - uniform).abs()
             );
         }
@@ -228,7 +285,7 @@ mod tests {
 
         let gap = (spectrum.eigenvalues()[1] - spectrum.eigenvalues()[2]).abs();
         assert!(
-            gap < 1e-9,
+            gap < EIGENVALUE_TOLERANCE,
             "cycle(15): eigenvalues 1 and 2 differ by {gap:.3e}; the Fiedler pair should be \
              degenerate before a subspace test is meaningful"
         );
@@ -247,9 +304,25 @@ mod tests {
         let pair = spectrum.eigenvectors().columns(1, 2).into_owned();
         let residual = (&fourier - &pair * (pair.transpose() * &fourier)).norm();
         assert!(
-            residual < 1e-9,
+            residual < EIGENVALUE_TOLERANCE,
             "cycle(15): ‖F − QQᵀF‖_F = {residual:.3e} for the Fourier modes F and the \
-             computed Fiedler pair Q, tolerance 1e-9"
+             computed Fiedler pair Q, tolerance {EIGENVALUE_TOLERANCE:e}"
+        );
+    }
+
+    /// The 15-cycle's spectrum groups as the simple 0 followed by seven
+    /// degenerate pairs — the closed form's cos(2πk/15) symmetry.
+    #[test]
+    fn cycle15_degenerate_groups_match_the_closed_form() {
+        let graph = Graph::cycle(15).expect("cycle(15)");
+        let spectrum = Spectrum::of_negative_laplacian(&graph).expect("spectrum of cycle(15)");
+
+        let groups = spectrum.degenerate_groups(EIGENVALUE_TOLERANCE);
+        let expected: Vec<std::ops::Range<usize>> =
+            vec![0..1, 1..3, 3..5, 5..7, 7..9, 9..11, 11..13, 13..15];
+        assert_eq!(
+            groups, expected,
+            "cycle(15): degenerate groups are {groups:?}, closed form gives {expected:?}"
         );
     }
 
@@ -264,17 +337,18 @@ mod tests {
 
             let top = spectrum.eigenvalues()[0];
             assert!(
-                top.abs() < 1e-9,
-                "complete({n}): top eigenvalue is {top:.3e}, expected 0 (tolerance 1e-9)"
+                top.abs() < EIGENVALUE_TOLERANCE,
+                "complete({n}): top eigenvalue is {top:.3e}, expected 0 \
+                 (tolerance {EIGENVALUE_TOLERANCE:e})"
             );
 
             let bulk = -2.0 * (n as f64) / ((n - 1) as f64);
             for k in 1..n {
                 let got = spectrum.eigenvalues()[k];
                 assert!(
-                    (got - bulk).abs() < 1e-9,
+                    (got - bulk).abs() < EIGENVALUE_TOLERANCE,
                     "complete({n}): eigenvalue {k} is {got:.15}, closed form gives \
-                     {bulk:.15} (|Δ| = {:.3e}, tolerance 1e-9)",
+                     {bulk:.15} (|Δ| = {:.3e}, tolerance {EIGENVALUE_TOLERANCE:e})",
                     (got - bulk).abs()
                 );
             }
@@ -292,11 +366,26 @@ mod tests {
         let uniform = 1.0 / (n as f64).sqrt();
         for (vertex, &component) in top.iter().enumerate() {
             assert!(
-                (component - uniform).abs() < 1e-9,
+                (component - uniform).abs() < EIGENVALUE_TOLERANCE,
                 "complete({n}): top eigenvector component {vertex} is {component:.15}, \
-                 expected {uniform:.15} (|Δ| = {:.3e}, tolerance 1e-9)",
+                 expected {uniform:.15} (|Δ| = {:.3e}, tolerance {EIGENVALUE_TOLERANCE:e})",
                 (component - uniform).abs()
             );
+        }
+    }
+
+    /// The rows of W = D⁻¹A each sum to one on every constructor.
+    #[test]
+    fn transition_rows_sum_to_one_on_every_constructor() {
+        for (name, graph) in test_fixtures() {
+            let walk = transition(&graph).expect("transition");
+            for (vertex, row) in walk.row_iter().enumerate() {
+                let sum = row.sum();
+                assert!(
+                    (sum - 1.0).abs() < RESIDUAL_TOLERANCE,
+                    "{name}: transition row {vertex} sums to {sum:.15}, expected 1"
+                );
+            }
         }
     }
 
@@ -304,12 +393,12 @@ mod tests {
     /// irregular-degree ones where I − D⁻¹A is not.
     #[test]
     fn laplacian_is_symmetric_on_every_constructor() {
-        for (name, graph) in fixtures() {
+        for (name, graph) in test_fixtures() {
             let l = laplacian(&graph).expect("laplacian");
             let asymmetry = (&l - l.transpose()).norm();
             assert!(
-                asymmetry < 1e-10,
-                "{name}: ‖L − Lᵀ‖_F = {asymmetry:.3e}, tolerance 1e-10"
+                asymmetry < RESIDUAL_TOLERANCE,
+                "{name}: ‖L − Lᵀ‖_F = {asymmetry:.3e}, tolerance {RESIDUAL_TOLERANCE:e}"
             );
         }
     }
@@ -317,15 +406,13 @@ mod tests {
     /// E Λ Eᵀ reconstructs −L on every constructor.
     #[test]
     fn spectrum_reconstructs_negative_laplacian_on_every_constructor() {
-        for (name, graph) in fixtures() {
+        for (name, graph) in test_fixtures() {
             let target = -laplacian(&graph).expect("laplacian");
             let spectrum = Spectrum::new(target.clone()).expect("spectrum");
-            let e = spectrum.eigenvectors();
-            let reconstruction = e * DMatrix::from_diagonal(spectrum.eigenvalues()) * e.transpose();
-            let residual = (&reconstruction - &target).norm();
+            let residual = reconstruction_residual(&spectrum, &target);
             assert!(
-                residual < 1e-10,
-                "{name}: ‖EΛEᵀ − (−L)‖_F = {residual:.3e}, tolerance 1e-10"
+                residual < RESIDUAL_TOLERANCE,
+                "{name}: ‖EΛEᵀ − (−L)‖_F = {residual:.3e}, tolerance {RESIDUAL_TOLERANCE:e}"
             );
         }
     }
@@ -333,15 +420,12 @@ mod tests {
     /// The eigenvectors are orthonormal on every constructor.
     #[test]
     fn spectrum_eigenvectors_are_orthonormal_on_every_constructor() {
-        for (name, graph) in fixtures() {
+        for (name, graph) in test_fixtures() {
             let spectrum = Spectrum::of_negative_laplacian(&graph).expect("spectrum");
-            let e = spectrum.eigenvectors();
-            let deviation = (e.transpose() * e
-                - DMatrix::<f64>::identity(spectrum.len(), spectrum.len()))
-            .norm();
+            let deviation = orthonormality_residual(&spectrum);
             assert!(
-                deviation < 1e-10,
-                "{name}: ‖EᵀE − I‖_F = {deviation:.3e}, tolerance 1e-10"
+                deviation < RESIDUAL_TOLERANCE,
+                "{name}: ‖EᵀE − I‖_F = {deviation:.3e}, tolerance {RESIDUAL_TOLERANCE:e}"
             );
         }
     }
@@ -349,7 +433,7 @@ mod tests {
     /// D5's ordering: eigenvalues descend on every constructor.
     #[test]
     fn spectrum_eigenvalues_descend_on_every_constructor() {
-        for (name, graph) in fixtures() {
+        for (name, graph) in test_fixtures() {
             let spectrum = Spectrum::of_negative_laplacian(&graph).expect("spectrum");
             for (k, window) in spectrum.eigenvalues().as_slice().windows(2).enumerate() {
                 assert!(
@@ -368,7 +452,7 @@ mod tests {
     /// `SIGN_PIVOT_TOLERANCE` is positive, on every constructor.
     #[test]
     fn spectrum_eigenvector_signs_are_deterministic_on_every_constructor() {
-        for (name, graph) in fixtures() {
+        for (name, graph) in test_fixtures() {
             let spectrum = Spectrum::of_negative_laplacian(&graph).expect("spectrum");
             for (k, column) in spectrum.eigenvectors().column_iter().enumerate() {
                 let Some(pivot) = column
@@ -410,6 +494,48 @@ mod tests {
                 assert_eq!((rows, columns), (2, 3), "reported {rows}×{columns}");
             }
             other => panic!("expected NotSquare, got {other:?}"),
+        }
+    }
+
+    /// A 0×0 matrix is square but rejected before nalgebra's empty-matrix
+    /// assertion.
+    #[test]
+    fn spectrum_rejects_an_empty_matrix() {
+        match Spectrum::new(DMatrix::<f64>::zeros(0, 0)) {
+            Err(Error::EmptyMatrix) => {}
+            other => panic!("expected EmptyMatrix, got {other:?}"),
+        }
+    }
+
+    /// NaN and infinite entries are rejected with the offending index rather
+    /// than decomposed into a NaN spectrum.
+    #[test]
+    fn spectrum_rejects_non_finite_entries() {
+        let mut with_nan = DMatrix::<f64>::identity(3, 3);
+        with_nan[(0, 2)] = f64::NAN;
+        with_nan[(2, 0)] = f64::NAN;
+        match Spectrum::new(with_nan) {
+            Err(Error::NonFinite { row: 0, column: 2 }) => {}
+            other => panic!("expected NonFinite at (0, 2), got {other:?}"),
+        }
+
+        let mut with_inf = DMatrix::<f64>::identity(3, 3);
+        with_inf[(1, 1)] = f64::INFINITY;
+        match Spectrum::new(with_inf) {
+            Err(Error::NonFinite { row: 1, column: 1 }) => {}
+            other => panic!("expected NonFinite at (1, 1), got {other:?}"),
+        }
+    }
+
+    /// An asymmetric matrix is rejected instead of being silently decomposed
+    /// as its lower-triangle mirror.
+    #[test]
+    fn spectrum_rejects_an_asymmetric_matrix() {
+        let mut asymmetric = DMatrix::<f64>::identity(3, 3);
+        asymmetric[(0, 1)] = 99.0;
+        match Spectrum::new(asymmetric) {
+            Err(Error::NotSymmetric { row: 0, column: 1 }) => {}
+            other => panic!("expected NotSymmetric at (0, 1), got {other:?}"),
         }
     }
 }

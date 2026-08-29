@@ -1,11 +1,12 @@
 //! Public-surface seam for the scaffold: `Runner` task lifecycle and
 //! `Settings` output-directory handling.
 //!
-//! Uses exported items only, and never writes inside the repository tree —
-//! every filesystem assertion runs against a uniquely named path under the
-//! system temp directory, removed when its guard drops. `SETTINGS` is a
+//! Filesystem assertions run against uniquely named paths under the system
+//! temp directory, removed when their guards drop. `SETTINGS` is a
 //! process-wide `LazyLock`, so these tests construct `Settings` values
-//! directly instead of dereferencing it or touching `RUN_MODE`.
+//! directly instead of dereferencing it or touching `RUN_MODE`. Every await
+//! on a `Runner` is bounded by [`SHUTDOWN_BOUND`], turning a lifecycle
+//! regression into a named failure instead of a hung binary.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +15,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rediscovery::error::Error;
 use rediscovery::settings::{Logger, Output, Rng, Settings};
 use rediscovery::subsystems::runner::Runner;
+
+/// Upper bound on lifecycle awaits; the passing paths resolve without
+/// waiting on it.
+const SHUTDOWN_BOUND: Duration = Duration::from_secs(5);
+
+/// Scheduler passes the drain-test job needs before it can finish, chosen
+/// well above the await points any single `shutdown()` call contains.
+const DRAIN_YIELDS: usize = 64;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -61,29 +70,35 @@ fn settings_with_output_dir(dir: PathBuf) -> Settings {
     }
 }
 
+/// `shutdown().await` bounded by [`SHUTDOWN_BOUND`].
+async fn bounded_shutdown(runner: &Runner) {
+    tokio::time::timeout(SHUTDOWN_BOUND, runner.shutdown())
+        .await
+        .expect("shutdown() did not complete within SHUTDOWN_BOUND");
+}
+
 /// `shutdown()` does not return until a spawned job has finished. The job
-/// here is released before `shutdown()` is called, and `#[tokio::test]`
-/// builds a current-thread runtime, so the drain inside `shutdown()` is the
-/// only point at which the job can make progress.
+/// needs [`DRAIN_YIELDS`] scheduler passes on this current-thread runtime,
+/// so an early return from the drain leaves it unfinished.
 #[tokio::test]
 async fn runner_shutdown_drains_a_spawned_job() {
     let started = Instant::now();
 
     let runner = Runner::new();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel::<()>();
 
     runner.spawn(move |_token| async move {
-        let _ = release_rx.await;
+        for _ in 0..DRAIN_YIELDS {
+            tokio::task::yield_now().await;
+        }
         let _ = finished_tx.send(());
     });
 
-    release_tx.send(()).expect("release receiver is alive");
-    runner.shutdown().await;
+    bounded_shutdown(&runner).await;
 
     assert!(
         finished_rx.try_recv().is_ok(),
-        "shutdown() returned before the spawned job finished"
+        "shutdown() returned before the spawned job finished its {DRAIN_YIELDS} passes"
     );
 
     println!(
@@ -92,28 +107,47 @@ async fn runner_shutdown_drains_a_spawned_job() {
     );
 }
 
-/// Cancelling the root token reaches a job spawned with a child token. The
-/// success path resolves without waiting; the bound only turns the failure
-/// mode — an event that never arrives — from a hung binary into a message.
+/// Each job receives its own child token: cancelling the token one job was
+/// handed cancels neither the root nor a sibling job's token.
 #[tokio::test]
-async fn cancellation_token_reaches_a_spawned_job() {
+async fn child_tokens_are_isolated_per_job() {
     let runner = Runner::new();
-    let (observed_tx, observed_rx) = tokio::sync::oneshot::channel::<()>();
+    let (token_tx, token_rx) = tokio::sync::oneshot::channel();
+    let (sibling_tx, mut sibling_rx) = tokio::sync::oneshot::channel::<()>();
 
-    runner.spawn(|token| async move {
+    runner.spawn(move |token| async move {
+        let _ = token_tx.send(token);
+    });
+    runner.spawn(move |token| async move {
         token.cancelled().await;
-        let _ = observed_tx.send(());
+        let _ = sibling_tx.send(());
     });
 
-    runner.cancellation_token().cancel();
+    let job_token = tokio::time::timeout(SHUTDOWN_BOUND, token_rx)
+        .await
+        .expect("first job did not hand its token out in time")
+        .expect("token sender dropped");
 
-    let observed = tokio::time::timeout(Duration::from_secs(5), observed_rx).await;
+    job_token.cancel();
+    tokio::task::yield_now().await;
+
     assert!(
-        matches!(observed, Ok(Ok(()))),
-        "spawned job did not observe cancellation of the root token within 5s: {observed:?}"
+        !runner.cancellation_token().is_cancelled(),
+        "cancelling a job's token cancelled the root token"
+    );
+    assert!(
+        sibling_rx.try_recv().is_err(),
+        "cancelling one job's token reached a sibling job's token"
     );
 
-    runner.shutdown().await;
+    runner.cancellation_token().cancel();
+    let observed = tokio::time::timeout(SHUTDOWN_BOUND, sibling_rx).await;
+    assert!(
+        matches!(observed, Ok(Ok(()))),
+        "sibling job did not observe root cancellation: {observed:?}"
+    );
+
+    bounded_shutdown(&runner).await;
 }
 
 /// `shutdown()` leaves the root token cancelled and completes with no jobs
@@ -122,7 +156,7 @@ async fn cancellation_token_reaches_a_spawned_job() {
 async fn runner_shutdown_with_no_jobs_cancels_the_root_token() {
     let runner = Runner::new();
 
-    runner.shutdown().await;
+    bounded_shutdown(&runner).await;
 
     assert!(
         runner.cancellation_token().is_cancelled(),

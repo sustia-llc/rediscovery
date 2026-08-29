@@ -84,13 +84,18 @@ mod tests {
 
     /// `shutdown()` waits for every spawned job to actually finish (the
     /// "drain" step) before returning, independent of whether the job reacts
-    /// to cancellation at all.
+    /// to cancellation at all. The job needs 64 scheduler passes on this
+    /// current-thread runtime, so an early return from the drain leaves it
+    /// unfinished.
     #[tokio::test]
     async fn shutdown_drains_spawned_jobs() {
         let runner = Runner::new();
         let completed = Arc::new(AtomicBool::new(false));
         let completed_clone = Arc::clone(&completed);
         runner.spawn(move |_token| async move {
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
             completed_clone.store(true, Ordering::SeqCst);
         });
 
@@ -115,8 +120,10 @@ mod tests {
 
         runner.cancellation_token().cancel();
 
-        rx.await
-            .expect("child token should observe cancellation of the root token");
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("child token did not observe cancellation of the root token within 5s")
+            .expect("cancellation sender dropped");
     }
 
     /// `shutdown()` with no spawned jobs completes (nothing to drain) and

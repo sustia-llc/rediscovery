@@ -6,43 +6,6 @@
 //! `std::error::Error` types that are `Send + Sync + 'static` — true of
 //! every `#[from]` source here.
 
-/// Names the graph-constructor parameter that [`Error::InvalidGraphParameter`]
-/// rejected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum GraphParameter {
-    /// Number of disjoint paths leaving a path-star root.
-    Arms,
-    /// Vertices per path-star arm, excluding the root.
-    ArmLength,
-    /// Grid row count.
-    Rows,
-    /// Grid column count.
-    Columns,
-    /// Vertex count of a cycle.
-    CycleOrder,
-    /// Degree of a tree-star's central vertex.
-    RootDegree,
-    /// Root-to-leaf path length of a tree-star, in edges.
-    PathLength,
-    /// Vertex count of a complete graph.
-    Order,
-}
-
-impl std::fmt::Display for GraphParameter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            Self::Arms => "arms",
-            Self::ArmLength => "arm_len",
-            Self::Rows => "rows",
-            Self::Columns => "cols",
-            Self::CycleOrder | Self::Order => "n",
-            Self::RootDegree => "d",
-            Self::PathLength => "ell",
-        };
-        f.write_str(name)
-    }
-}
-
 /// All fallible operations in the library funnel through this enum.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -54,7 +17,7 @@ pub enum Error {
 
     #[error("graph parameter `{parameter}` must be at least {minimum}, got {value}")]
     InvalidGraphParameter {
-        parameter: GraphParameter,
+        parameter: &'static str,
         minimum: usize,
         value: usize,
     },
@@ -65,8 +28,8 @@ pub enum Error {
     #[error("self-loop at vertex {vertex}: graphs in this crate are loop-free")]
     SelfLoop { vertex: usize },
 
-    #[error("the requested graph exceeds the addressable vertex count")]
-    GraphTooLarge,
+    #[error("`{constructor}` was asked for a vertex count beyond the representable range")]
+    GraphTooLarge { constructor: &'static str },
 
     #[error("vertex {vertex} has degree zero, so D⁻¹ does not exist")]
     IsolatedVertex { vertex: usize },
@@ -74,8 +37,14 @@ pub enum Error {
     #[error("expected a square matrix, got {rows}×{columns}")]
     NotSquare { rows: usize, columns: usize },
 
-    #[error("symmetric eigendecomposition of a {order}×{order} matrix did not converge")]
-    EigenNotConverged { order: usize },
+    #[error("expected a non-empty matrix, got 0×0")]
+    EmptyMatrix,
+
+    #[error("matrix entry ({row}, {column}) is not finite")]
+    NonFinite { row: usize, column: usize },
+
+    #[error("matrix entries ({row}, {column}) and ({column}, {row}) differ")]
+    NotSymmetric { row: usize, column: usize },
 }
 
 /// Crate-wide result alias over [`Error`].

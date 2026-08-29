@@ -1,16 +1,17 @@
 //! Graph construction for Tier 0 of the POC.
 //!
 //! [`Graph`] stores an undirected, loop-free, unweighted graph as a dense
-//! `DMatrix<f64>` adjacency matrix plus a degree vector; the POC's topologies
-//! stay at n ≤ ~50, where dense storage costs nothing. Constructors cover the
-//! four tiny graphs the paper studies ([`Graph::path_star`], [`Graph::grid`],
-//! [`Graph::cycle`], [`Graph::irregular`]), the tree-star family of Appendix
-//! C.2 ([`Graph::tree_star`]), and [`Graph::complete`] as a test aid. The
-//! `spectral` module and the `Node2Vec` dynamics of later tiers consume these.
+//! `DMatrix<f64>` adjacency matrix plus a degree vector. Constructors cover
+//! the four tiny graphs the paper studies ([`Graph::path_star`],
+//! [`Graph::grid`], [`Graph::cycle`], [`Graph::irregular`]), the tree-star
+//! family of Appendix C.2 ([`Graph::tree_star`]), and [`Graph::complete`] as
+//! a test aid. The `spectral` module and the `Node2Vec` dynamics of later
+//! tiers consume these. Decision labels (D1–D10) refer to
+//! `docs/2510.26745v2-poc-analysis.md` §8.
 
 use nalgebra::{DMatrix, DVector};
 
-use crate::error::{Error, GraphParameter, Result};
+use crate::error::{Error, Result};
 
 /// An undirected, loop-free, unweighted graph over vertices `0..order`.
 ///
@@ -18,7 +19,7 @@ use crate::error::{Error, GraphParameter, Result};
 /// {0.0, 1.0}; the degree vector holds each vertex's adjacency row sum. Both
 /// invariants are established at construction and the fields are private, so
 /// every `Graph` value satisfies them.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Graph {
     adjacency: DMatrix<f64>,
     degrees: DVector<f64>,
@@ -31,29 +32,31 @@ impl Graph {
     /// # Errors
     ///
     /// Returns [`Error::InvalidGraphParameter`] if `order` is zero,
-    /// [`Error::SelfLoop`] for an edge with equal endpoints, and
-    /// [`Error::EdgeOutOfBounds`] for an endpoint at or beyond `order`.
+    /// [`Error::GraphTooLarge`] if `order * order` overflows `usize`,
+    /// [`Error::EdgeOutOfBounds`] for an endpoint at or beyond `order`, and
+    /// [`Error::SelfLoop`] for an in-range edge with equal endpoints.
     pub fn from_edges(order: usize, edges: &[(usize, usize)]) -> Result<Self> {
-        require_at_least(GraphParameter::Order, 1, order)?;
+        require_at_least("order", 1, order)?;
+        ensure_representable("from_edges", order)?;
 
         let mut adjacency = DMatrix::<f64>::zeros(order, order);
         for &(u, v) in edges {
-            if u == v {
-                return Err(Error::SelfLoop { vertex: u });
-            }
             if u >= order || v >= order {
                 return Err(Error::EdgeOutOfBounds { u, v, order });
+            }
+            if u == v {
+                return Err(Error::SelfLoop { vertex: u });
             }
             adjacency[(u, v)] = 1.0;
             adjacency[(v, u)] = 1.0;
         }
 
-        let degrees = DVector::from_iterator(order, adjacency.row_iter().map(|row| row.sum()));
+        let degrees = adjacency.column_sum();
         Ok(Self { adjacency, degrees })
     }
 
     /// Builds a path-star: a central root with `arms` disjoint paths, each
-    /// carrying `arm_len` vertices beyond the root.
+    /// carrying `arm_len` vertices beyond the root (decision D1).
     ///
     /// The result has `1 + arms * arm_len` vertices and `arms * arm_len`
     /// edges; the root is vertex 0 and arm `a` occupies the contiguous block
@@ -62,16 +65,19 @@ impl Graph {
     /// # Errors
     ///
     /// Returns [`Error::InvalidGraphParameter`] if `arms` or `arm_len` is
-    /// zero, and [`Error::GraphTooLarge`] if the vertex count overflows
-    /// `usize`.
+    /// zero, and [`Error::GraphTooLarge`] if the vertex count is not
+    /// representable.
     pub fn path_star(arms: usize, arm_len: usize) -> Result<Self> {
-        require_at_least(GraphParameter::Arms, 1, arms)?;
-        require_at_least(GraphParameter::ArmLength, 1, arm_len)?;
+        require_at_least("arms", 1, arms)?;
+        require_at_least("arm_len", 1, arm_len)?;
 
         let order = arms
             .checked_mul(arm_len)
             .and_then(|leaves| leaves.checked_add(1))
-            .ok_or(Error::GraphTooLarge)?;
+            .ok_or(Error::GraphTooLarge {
+                constructor: "path_star",
+            })?;
+        ensure_representable("path_star", order)?;
 
         let mut edges = Vec::with_capacity(order - 1);
         for arm in 0..arms {
@@ -85,7 +91,7 @@ impl Graph {
         Self::from_edges(order, &edges)
     }
 
-    /// Builds a `rows` × `cols` four-neighbour lattice.
+    /// Builds a `rows` × `cols` four-neighbour lattice (decision D2).
     ///
     /// The result has `rows * cols` vertices and
     /// `rows * (cols - 1) + cols * (rows - 1)` edges; vertex `(r, c)` is
@@ -94,12 +100,15 @@ impl Graph {
     /// # Errors
     ///
     /// Returns [`Error::InvalidGraphParameter`] if `rows` or `cols` is zero,
-    /// and [`Error::GraphTooLarge`] if the vertex count overflows `usize`.
+    /// and [`Error::GraphTooLarge`] if the vertex count is not representable.
     pub fn grid(rows: usize, cols: usize) -> Result<Self> {
-        require_at_least(GraphParameter::Rows, 1, rows)?;
-        require_at_least(GraphParameter::Columns, 1, cols)?;
+        require_at_least("rows", 1, rows)?;
+        require_at_least("cols", 1, cols)?;
 
-        let order = rows.checked_mul(cols).ok_or(Error::GraphTooLarge)?;
+        let order = rows.checked_mul(cols).ok_or(Error::GraphTooLarge {
+            constructor: "grid",
+        })?;
+        ensure_representable("grid", order)?;
 
         let mut edges = Vec::new();
         for r in 0..rows {
@@ -118,31 +127,29 @@ impl Graph {
     }
 
     /// Builds the `n`-vertex cycle, with vertex `i` adjacent to
-    /// `(i + 1) % n`.
+    /// `(i + 1) % n` (decision D3).
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidGraphParameter`] if `n < 3`, the smallest
-    /// cycle expressible without repeated edges.
+    /// cycle expressible without repeated edges, and [`Error::GraphTooLarge`]
+    /// if the vertex count is not representable.
     pub fn cycle(n: usize) -> Result<Self> {
-        require_at_least(GraphParameter::CycleOrder, 3, n)?;
+        require_at_least("n", 3, n)?;
+        ensure_representable("cycle", n)?;
 
         let edges: Vec<(usize, usize)> = (0..n).map(|i| (i, (i + 1) % n)).collect();
         Self::from_edges(n, &edges)
     }
 
-    /// Builds the 15-vertex, two-component irregular graph of decision D4.
-    ///
-    /// Component A is an 11-cycle on vertices 0–10 with chords (0, 2) and
+    /// Builds the 15-vertex, two-component irregular graph of decision D4:
+    /// component A is an 11-cycle on vertices 0–10 with chords (0, 2) and
     /// (5, 7); component B is a kite — a triangle on 11, 12, 13 with vertex
-    /// 14 adjacent to 12 and 13. The two components share no edge. 18 edges
-    /// total. This approximates the paper's Figure 21, which publishes no
-    /// adjacency list.
+    /// 14 adjacent to 12 and 13. 18 edges total.
     ///
     /// # Errors
     ///
-    /// Returns an error only if the fixed edge list violates a [`Graph`]
-    /// invariant, which construction of this fixed topology does not.
+    /// Propagates [`Graph::from_edges`] errors.
     pub fn irregular() -> Result<Self> {
         let mut edges: Vec<(usize, usize)> = (0..11).map(|i| (i, (i + 1) % 11)).collect();
         edges.extend_from_slice(&[
@@ -167,23 +174,28 @@ impl Graph {
     /// # Errors
     ///
     /// Returns [`Error::InvalidGraphParameter`] if `d` or `ell` is zero, and
-    /// [`Error::GraphTooLarge`] if the vertex count overflows `usize`.
+    /// [`Error::GraphTooLarge`] if the vertex count is not representable.
     pub fn tree_star(d: usize, ell: usize) -> Result<Self> {
-        require_at_least(GraphParameter::RootDegree, 1, d)?;
-        require_at_least(GraphParameter::PathLength, 1, ell)?;
+        require_at_least("d", 1, d)?;
+        require_at_least("ell", 1, ell)?;
 
         // Per-arm vertex count 2^ell - 1, summed level by level so that the
         // loop is linear in `ell` and overflow is caught before allocating.
         let mut per_arm: usize = 0;
         let mut level: usize = 1;
         for _ in 0..ell {
-            per_arm = per_arm.checked_add(level).ok_or(Error::GraphTooLarge)?;
+            per_arm = per_arm.checked_add(level).ok_or(Error::GraphTooLarge {
+                constructor: "tree_star",
+            })?;
             level = level.saturating_mul(2);
         }
         let order = d
             .checked_mul(per_arm)
             .and_then(|descendants| descendants.checked_add(1))
-            .ok_or(Error::GraphTooLarge)?;
+            .ok_or(Error::GraphTooLarge {
+                constructor: "tree_star",
+            })?;
+        ensure_representable("tree_star", order)?;
 
         let mut edges = Vec::with_capacity(order - 1);
         let mut next_index = 1;
@@ -213,10 +225,11 @@ impl Graph {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidGraphParameter`] if `n < 2`, below which the
-    /// graph has no edges and its random-walk Laplacian is undefined.
+    /// Returns [`Error::InvalidGraphParameter`] if `n` is zero, and
+    /// [`Error::GraphTooLarge`] if the vertex count is not representable.
     pub fn complete(n: usize) -> Result<Self> {
-        require_at_least(GraphParameter::Order, 2, n)?;
+        require_at_least("n", 1, n)?;
+        ensure_representable("complete", n)?;
 
         let mut edges = Vec::with_capacity(n * (n - 1) / 2);
         for u in 0..n {
@@ -234,20 +247,15 @@ impl Graph {
         self.degrees.len()
     }
 
-    /// The number of undirected edges, counted from the adjacency matrix's
-    /// strict upper triangle.
+    /// The number of undirected edges, computed as half the degree sum.
     #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "degrees are exact non-negative integers in f64, so the half-sum is too"
+    )]
     pub fn edge_count(&self) -> usize {
-        let order = self.order();
-        let mut count = 0;
-        for u in 0..order {
-            for v in (u + 1)..order {
-                if self.adjacency[(u, v)] > 0.0 {
-                    count += 1;
-                }
-            }
-        }
-        count
+        (self.degrees.sum() / 2.0) as usize
     }
 
     /// The symmetric, zero-diagonal adjacency matrix `A`.
@@ -264,7 +272,7 @@ impl Graph {
 }
 
 /// Rejects `value` below `minimum`, naming `parameter` in the error.
-fn require_at_least(parameter: GraphParameter, minimum: usize, value: usize) -> Result<()> {
+fn require_at_least(parameter: &'static str, minimum: usize, value: usize) -> Result<()> {
     if value < minimum {
         return Err(Error::InvalidGraphParameter {
             parameter,
@@ -275,70 +283,61 @@ fn require_at_least(parameter: GraphParameter, minimum: usize, value: usize) -> 
     Ok(())
 }
 
+/// Rejects an `order` whose dense `order × order` adjacency cannot be
+/// addressed: nalgebra computes the backing length as an unchecked
+/// `nrows * ncols`, so the product must fit `usize` before any allocation.
+fn ensure_representable(constructor: &'static str, order: usize) -> Result<()> {
+    order
+        .checked_mul(order)
+        .map(|_| ())
+        .ok_or(Error::GraphTooLarge { constructor })
+}
+
+/// Every Tier-0 constructor with the label used in failure messages, shared
+/// by this module's tests and `spectral`'s.
+#[cfg(test)]
+pub(crate) fn test_fixtures() -> Vec<(&'static str, Graph)> {
+    vec![
+        (
+            "path_star(4,4)",
+            Graph::path_star(4, 4).expect("path_star(4,4)"),
+        ),
+        ("grid(4,4)", Graph::grid(4, 4).expect("grid(4,4)")),
+        ("cycle(15)", Graph::cycle(15).expect("cycle(15)")),
+        ("irregular()", Graph::irregular().expect("irregular()")),
+        (
+            "tree_star(3,3)",
+            Graph::tree_star(3, 3).expect("tree_star(3,3)"),
+        ),
+        ("complete(7)", Graph::complete(7).expect("complete(7)")),
+    ]
+}
+
 #[cfg(test)]
 #[allow(
     clippy::float_cmp,
-    reason = "adjacency entries and degrees are exact small integers in f64"
+    clippy::cast_precision_loss,
+    reason = "adjacency entries, degrees, and counts are exact small integers in f64"
 )]
 mod tests {
     use super::*;
 
-    /// Exact `usize` → `f64` for the small counts these tests compare.
-    fn exact(n: usize) -> f64 {
-        f64::from(u32::try_from(n).expect("test fixture counts fit in u32"))
-    }
-
-    /// Every constructor under test, with the label used in failure messages.
-    fn fixtures() -> Vec<(&'static str, Graph)> {
-        vec![
-            (
-                "path_star(4,4)",
-                Graph::path_star(4, 4).expect("path_star(4,4)"),
-            ),
-            ("grid(4,4)", Graph::grid(4, 4).expect("grid(4,4)")),
-            ("cycle(15)", Graph::cycle(15).expect("cycle(15)")),
-            ("irregular()", Graph::irregular().expect("irregular()")),
-            (
-                "tree_star(3,3)",
-                Graph::tree_star(3, 3).expect("tree_star(3,3)"),
-            ),
-            ("complete(7)", Graph::complete(7).expect("complete(7)")),
-        ]
-    }
-
     /// D1–D4 vertex counts, plus the edge count each topology implies.
     #[test]
     fn constructors_have_the_specified_node_and_edge_counts() {
-        let cases: [(&str, Graph, usize, usize); 6] = [
-            (
-                "path_star(4,4)",
-                Graph::path_star(4, 4).expect("path_star(4,4)"),
-                17,
-                16,
-            ),
-            ("grid(4,4)", Graph::grid(4, 4).expect("grid(4,4)"), 16, 24),
-            ("cycle(15)", Graph::cycle(15).expect("cycle(15)"), 15, 15),
-            (
-                "irregular()",
-                Graph::irregular().expect("irregular()"),
-                15,
-                18,
-            ),
-            (
-                "tree_star(3,3)",
-                Graph::tree_star(3, 3).expect("tree_star(3,3)"),
-                22,
-                21,
-            ),
-            (
-                "complete(7)",
-                Graph::complete(7).expect("complete(7)"),
-                7,
-                21,
-            ),
+        let expected: [(&str, usize, usize); 6] = [
+            ("path_star(4,4)", 17, 16),
+            ("grid(4,4)", 16, 24),
+            ("cycle(15)", 15, 15),
+            ("irregular()", 15, 18),
+            ("tree_star(3,3)", 22, 21),
+            ("complete(7)", 7, 21),
         ];
 
-        for (name, graph, order, edges) in cases {
+        for ((name, graph), (expected_name, order, edges)) in
+            test_fixtures().into_iter().zip(expected)
+        {
+            assert_eq!(name, expected_name, "fixture list order changed");
             assert_eq!(
                 graph.order(),
                 order,
@@ -392,7 +391,7 @@ mod tests {
             let label = format!("tree_star({d},{ell})");
 
             assert!(
-                (graph.degrees()[0] - exact(d)).abs() < 1e-12,
+                (graph.degrees()[0] - d as f64).abs() < 1e-12,
                 "{label}: root degree is {}, expected {d}",
                 graph.degrees()[0]
             );
@@ -426,7 +425,7 @@ mod tests {
     /// Adjacency is symmetric, zero on the diagonal, and 0/1 valued.
     #[test]
     fn constructors_are_undirected_and_loop_free() {
-        for (name, graph) in fixtures() {
+        for (name, graph) in test_fixtures() {
             let asymmetry = (graph.adjacency() - graph.adjacency().transpose()).amax();
             assert!(
                 asymmetry < 1e-15,
@@ -449,10 +448,12 @@ mod tests {
     }
 
     /// The stored degree vector agrees with the adjacency rows, and the
-    /// degree sum is twice the independently counted edge total.
+    /// degree sum is twice an edge total counted directly from the strict
+    /// upper triangle — the oracle stays independent of `edge_count()`,
+    /// which derives from the degree sum.
     #[test]
     fn degrees_agree_with_adjacency_and_edge_count() {
-        for (name, graph) in fixtures() {
+        for (name, graph) in test_fixtures() {
             for (vertex, row) in graph.adjacency().row_iter().enumerate() {
                 let row_sum = row.sum();
                 assert!(
@@ -462,11 +463,25 @@ mod tests {
                 );
             }
 
+            let mut triangle_count = 0_usize;
+            for u in 0..graph.order() {
+                for v in (u + 1)..graph.order() {
+                    if graph.adjacency()[(u, v)] > 0.0 {
+                        triangle_count += 1;
+                    }
+                }
+            }
+
             let degree_sum = graph.degrees().sum();
-            let expected = 2.0 * exact(graph.edge_count());
+            let expected = 2.0 * triangle_count as f64;
             assert!(
                 (degree_sum - expected).abs() < 1e-12,
-                "{name}: degree sum {degree_sum}, expected 2 × {} = {expected}",
+                "{name}: degree sum {degree_sum}, expected 2 × {triangle_count} = {expected}"
+            );
+            assert_eq!(
+                graph.edge_count(),
+                triangle_count,
+                "{name}: edge_count() is {}, upper-triangle count is {triangle_count}",
                 graph.edge_count()
             );
         }
@@ -497,8 +512,6 @@ mod tests {
     fn irregular_matches_the_d4_topology() {
         let graph = Graph::irregular().expect("irregular()");
 
-        // Checked before the edge-set equality below, which would otherwise
-        // absorb every cross-component edge and leave this assertion dead.
         for u in 0..11 {
             for v in 11..15 {
                 assert!(
@@ -561,35 +574,15 @@ mod tests {
     /// Degenerate parameters are rejected with a typed error naming them.
     #[test]
     fn degenerate_parameters_are_rejected() {
-        let cases: [(&str, Result<Graph>, GraphParameter, usize); 8] = [
-            (
-                "path_star(0,4)",
-                Graph::path_star(0, 4),
-                GraphParameter::Arms,
-                1,
-            ),
-            (
-                "path_star(4,0)",
-                Graph::path_star(4, 0),
-                GraphParameter::ArmLength,
-                1,
-            ),
-            ("grid(0,4)", Graph::grid(0, 4), GraphParameter::Rows, 1),
-            ("grid(4,0)", Graph::grid(4, 0), GraphParameter::Columns, 1),
-            ("cycle(2)", Graph::cycle(2), GraphParameter::CycleOrder, 3),
-            (
-                "tree_star(0,2)",
-                Graph::tree_star(0, 2),
-                GraphParameter::RootDegree,
-                1,
-            ),
-            (
-                "tree_star(2,0)",
-                Graph::tree_star(2, 0),
-                GraphParameter::PathLength,
-                1,
-            ),
-            ("complete(1)", Graph::complete(1), GraphParameter::Order, 2),
+        let cases: [(&str, Result<Graph>, &'static str, usize); 8] = [
+            ("path_star(0,4)", Graph::path_star(0, 4), "arms", 1),
+            ("path_star(4,0)", Graph::path_star(4, 0), "arm_len", 1),
+            ("grid(0,4)", Graph::grid(0, 4), "rows", 1),
+            ("grid(4,0)", Graph::grid(4, 0), "cols", 1),
+            ("cycle(2)", Graph::cycle(2), "n", 3),
+            ("tree_star(0,2)", Graph::tree_star(0, 2), "d", 1),
+            ("tree_star(2,0)", Graph::tree_star(2, 0), "ell", 1),
+            ("complete(0)", Graph::complete(0), "n", 1),
         ];
 
         for (name, result, parameter, minimum) in cases {
@@ -617,7 +610,22 @@ mod tests {
         }
     }
 
-    /// `from_edges` refuses self-loops and out-of-range endpoints.
+    /// A single-vertex complete graph is a valid, edgeless graph; rejecting
+    /// its missing D⁻¹ is the spectral layer's job.
+    #[test]
+    fn complete_one_is_a_valid_edgeless_graph() {
+        let graph = Graph::complete(1).expect("complete(1)");
+        assert_eq!(graph.order(), 1, "order is {}, expected 1", graph.order());
+        assert_eq!(
+            graph.edge_count(),
+            0,
+            "edge count is {}, expected 0",
+            graph.edge_count()
+        );
+    }
+
+    /// `from_edges` refuses out-of-range endpoints and self-loops, checking
+    /// the range first so an out-of-range self-loop names the range error.
     #[test]
     fn from_edges_rejects_invalid_edges() {
         match Graph::from_edges(4, &[(1, 1)]) {
@@ -629,6 +637,57 @@ mod tests {
                 assert_eq!((u, v, order), (1, 4, 4), "reported ({u}, {v}, {order})");
             }
             other => panic!("expected EdgeOutOfBounds, got {other:?}"),
+        }
+        match Graph::from_edges(4, &[(9, 9)]) {
+            Err(Error::EdgeOutOfBounds { u, v, order }) => {
+                assert_eq!((u, v, order), (9, 9, 4), "reported ({u}, {v}, {order})");
+            }
+            other => {
+                panic!("expected EdgeOutOfBounds for an out-of-range self-loop, got {other:?}")
+            }
+        }
+    }
+
+    /// Unrepresentable vertex counts come back as `GraphTooLarge` from every
+    /// constructor, at no allocation cost.
+    #[test]
+    fn oversized_graphs_are_rejected() {
+        let cases: [(&str, Result<Graph>, &'static str); 5] = [
+            (
+                "path_star(usize::MAX, 2)",
+                Graph::path_star(usize::MAX, 2),
+                "path_star",
+            ),
+            (
+                "grid(1 << 20, 1 << 20)",
+                Graph::grid(1 << 20, 1 << 20),
+                "grid",
+            ),
+            ("cycle(1 << 33)", Graph::cycle(1 << 33), "cycle"),
+            ("tree_star(1, 40)", Graph::tree_star(1, 40), "tree_star"),
+            (
+                "from_edges(1 << 33, [])",
+                Graph::from_edges(1 << 33, &[]),
+                "from_edges",
+            ),
+        ];
+
+        for (name, result, constructor) in cases {
+            match result {
+                Err(Error::GraphTooLarge {
+                    constructor: observed,
+                }) => {
+                    assert_eq!(
+                        observed, constructor,
+                        "{name}: reported constructor `{observed}`, expected `{constructor}`"
+                    );
+                }
+                Err(other) => panic!("{name}: expected GraphTooLarge, got {other:?}"),
+                Ok(graph) => panic!(
+                    "{name}: expected rejection, built a {}-vertex graph",
+                    graph.order()
+                ),
+            }
         }
     }
 }

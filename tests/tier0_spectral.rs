@@ -13,6 +13,14 @@ use rediscovery::error::Result;
 use rediscovery::graph::Graph;
 use rediscovery::spectral::{Spectrum, laplacian};
 
+/// Tolerance for eigenvalues checked against closed forms.
+const EIGENVALUE_TOLERANCE: f64 = 1e-9;
+/// Tolerance for Frobenius residuals of exact matrix identities.
+const RESIDUAL_TOLERANCE: f64 = 1e-10;
+/// Tolerance for two computations of the same matrix that differ only in
+/// floating-point association order.
+const DRIFT_TOLERANCE: f64 = 1e-12;
+
 /// A constructor callable twice to produce independent, identical graphs.
 type Builder = fn() -> Result<Graph>;
 
@@ -48,26 +56,30 @@ fn graph_to_spectrum_flow_for_every_constructor() {
             l.shape()
         );
 
-        // Reference written from the Appendix F definition, not copied from
-        // the implementation: I − D⁻¹A, then X + Xᵀ.
-        let mut walk = graph.adjacency().clone();
-        for (vertex, mut row) in walk.row_iter_mut().enumerate() {
-            row /= graph.degrees()[vertex];
-        }
-        let deviation = DMatrix::<f64>::identity(n, n) - walk;
-        let reference = &deviation + deviation.transpose();
+        // Entrywise reference from the Appendix F formula's closed form:
+        // L has diagonal 2 and off-diagonal −(1/d_u + 1/d_v) exactly where
+        // A has an edge.
+        let reference = DMatrix::<f64>::from_fn(n, n, |u, v| {
+            if u == v {
+                2.0
+            } else if graph.adjacency()[(u, v)] > 0.0 {
+                -(1.0 / graph.degrees()[u] + 1.0 / graph.degrees()[v])
+            } else {
+                0.0
+            }
+        });
         let drift = (&l - &reference).norm();
         assert!(
-            drift < 1e-12,
-            "{name}: ‖laplacian() − (I − D⁻¹A) − (I − D⁻¹A)ᵀ‖_F = {drift:.3e}, tolerance 1e-12"
+            drift < DRIFT_TOLERANCE,
+            "{name}: ‖laplacian() − closed form‖_F = {drift:.3e}, tolerance {DRIFT_TOLERANCE:e}"
         );
 
         let spectrum = Spectrum::of_negative_laplacian(&graph).expect("spectrum");
         assert_eq!(
-            spectrum.len(),
+            spectrum.order(),
             n,
             "{name}: spectrum holds {} eigenpairs, expected {n}",
-            spectrum.len()
+            spectrum.order()
         );
         assert_eq!(
             spectrum.eigenvectors().shape(),
@@ -76,24 +88,18 @@ fn graph_to_spectrum_flow_for_every_constructor() {
             spectrum.eigenvectors().shape()
         );
 
-        // Orthonormality is checked before the reconstruction below, which
-        // would otherwise absorb every loss of orthonormality and leave this
-        // assertion dead. Reconstruction still has its own reach: it fails on
-        // an eigenpair mispairing that leaves EᵀE = I.
         let e = spectrum.eigenvectors();
         let orthonormality = (e.transpose() * e - DMatrix::<f64>::identity(n, n)).norm();
         assert!(
-            orthonormality < 1e-10,
-            "{name}: ‖EᵀE − I‖_F = {orthonormality:.3e}, tolerance 1e-10"
+            orthonormality < RESIDUAL_TOLERANCE,
+            "{name}: ‖EᵀE − I‖_F = {orthonormality:.3e}, tolerance {RESIDUAL_TOLERANCE:e}"
         );
 
-        // E Λ Eᵀ is −L, so adding the L obtained from the other public entry
-        // point must cancel. This ties the two exported functions together.
         let reconstruction = e * DMatrix::from_diagonal(spectrum.eigenvalues()) * e.transpose();
         let residual = (&reconstruction + &l).norm();
         assert!(
-            residual < 1e-10,
-            "{name}: ‖EΛEᵀ + L‖_F = {residual:.3e}, tolerance 1e-10"
+            residual < RESIDUAL_TOLERANCE,
+            "{name}: ‖EΛEᵀ + L‖_F = {residual:.3e}, tolerance {RESIDUAL_TOLERANCE:e}"
         );
     }
 
@@ -148,9 +154,9 @@ fn cycle15_closed_form_through_the_public_api() {
     for (k, &want) in expected.iter().enumerate() {
         let got = spectrum.eigenvalues()[k];
         assert!(
-            (got - want).abs() < 1e-9,
+            (got - want).abs() < EIGENVALUE_TOLERANCE,
             "cycle(15): eigenvalue {k} is {got:.15}, closed form gives {want:.15} \
-             (|Δ| = {:.3e}, tolerance 1e-9)",
+             (|Δ| = {:.3e}, tolerance {EIGENVALUE_TOLERANCE:e})",
             (got - want).abs()
         );
     }
@@ -159,9 +165,9 @@ fn cycle15_closed_form_through_the_public_api() {
     let uniform = 1.0 / 15.0_f64.sqrt();
     for (vertex, &component) in top.iter().enumerate() {
         assert!(
-            (component - uniform).abs() < 1e-9,
+            (component - uniform).abs() < EIGENVALUE_TOLERANCE,
             "cycle(15): top eigenvector component {vertex} is {component:.15}, \
-             expected {uniform:.15} (|Δ| = {:.3e}, tolerance 1e-9)",
+             expected {uniform:.15} (|Δ| = {:.3e}, tolerance {EIGENVALUE_TOLERANCE:e})",
             (component - uniform).abs()
         );
     }
