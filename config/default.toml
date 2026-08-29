@@ -1,0 +1,10 @@
+environment = "development"
+
+[logger]
+level = "info"
+
+[output]
+dir = "output"
+
+[rng]
+seed = 42
