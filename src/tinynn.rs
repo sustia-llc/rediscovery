@@ -508,11 +508,12 @@ impl TinyNn {
             pre_gradient.component_mul_assign(&derivative);
         }
 
-        let weight = parameters.embedding.tr_mul(&pre_gradient);
+        let weight = parameters.embedding.transpose() * &pre_gradient;
         let embedding = match regime {
             Regime::FrozenEmbedding => None,
             Regime::LearnableEmbedding => Some(
-                residual.tr_mul(&forward.hidden) + &pre_gradient * parameters.weight.transpose(),
+                residual.transpose() * &forward.hidden
+                    + &pre_gradient * parameters.weight.transpose(),
             ),
         };
         Gradients { weight, embedding }
@@ -1855,11 +1856,18 @@ mod tests {
     /// Movement in the Fiedler alignment over a learnable run below which the
     /// criterion is reading something other than the trained embedding. The
     /// smallest measured move over `GEOMETRIC_SWEEP` and the four D-graphs at
-    /// seed 20260829 is 0.0309, on the 4×4 grid at η = 0.001.
+    /// seed 20260829 is 0.0308, on the 4×4 grid at η = 0.01.
     const ALIGNMENT_DRIFT: f64 = 1e-3;
 
-    /// Runs `params` on `graph` into temp files, printing the measurement.
+    /// Runs `params` on `graph` at [`SEED`] into temp files, printing the
+    /// measurement.
     fn measured_run(label: &str, graph: &Graph, params: &Params) -> Run {
+        measured_run_at(label, graph, params, SEED)
+    }
+
+    /// Runs `params` on `graph` at `seed` into temp files, printing the
+    /// measurement.
+    fn measured_run_at(label: &str, graph: &Graph, params: &Params, seed: u64) -> Run {
         let history = TempPath::new("history");
         let cosines = TempPath::new("cosines");
         let outputs = Outputs {
@@ -1867,7 +1875,7 @@ mod tests {
             cosines: cosines.path(),
         };
         let started = Instant::now();
-        let run = run(graph, params, SEED, &outputs, || false).expect("run");
+        let run = run(graph, params, seed, &outputs, || false).expect("run");
         let last = run.last().expect("a run records its initial state");
         println!(
             "{label}: {:?}, outcome {:?}, {} steps, loss {:.6} (was {:.6}), \
@@ -1895,6 +1903,172 @@ mod tests {
         run
     }
 
+    /// The second seed the frozen-run instruments measure over, beside
+    /// [`SEED`]: the pair `tests/tier2_tinynn.rs`'s `TIMING_SEEDS` times.
+    const SECOND_SEED: u64 = 42;
+
+    /// The Pearson correlation of two square same-order matrices over their
+    /// n(n − 1) off-diagonal entries (u, v), u ≠ v: with x and y those entries
+    /// of the two matrices and x̄, ȳ their means,
+    /// Σ(x − x̄)(y − ȳ) / √(Σ(x − x̄)² · Σ(y − ȳ)²). Panics on a shape
+    /// mismatch or a constant off-diagonal on either side.
+    fn off_diagonal_correlation(left: &DMatrix<f64>, right: &DMatrix<f64>) -> f64 {
+        assert_eq!(
+            left.nrows(),
+            left.ncols(),
+            "off_diagonal_correlation takes square matrices"
+        );
+        assert_eq!(
+            left.shape(),
+            right.shape(),
+            "off_diagonal_correlation takes same-order matrices"
+        );
+        let order = left.nrows();
+        let pairs: Vec<(f64, f64)> = (0..order)
+            .flat_map(|u| (0..order).map(move |v| (u, v)))
+            .filter(|&(u, v)| u != v)
+            .map(|(u, v)| (left[(u, v)], right[(u, v)]))
+            .collect();
+        let count = pairs.len() as f64;
+        let left_mean = pairs.iter().map(|&(x, _)| x).sum::<f64>() / count;
+        let right_mean = pairs.iter().map(|&(_, y)| y).sum::<f64>() / count;
+
+        let mut covariance = 0.0;
+        let mut left_spread = 0.0;
+        let mut right_spread = 0.0;
+        for &(x, y) in &pairs {
+            let dx = x - left_mean;
+            let dy = y - right_mean;
+            covariance += dx * dy;
+            left_spread += dx * dx;
+            right_spread += dy * dy;
+        }
+        assert!(
+            left_spread > 0.0 && right_spread > 0.0,
+            "off_diagonal_correlation needs non-constant off-diagonal entries"
+        );
+        covariance / (left_spread * right_spread).sqrt()
+    }
+
+    /// The parameters after `steps` updates from the `seed` draw, replaying
+    /// `run`'s loop through the public gradient API: each step subtracts η
+    /// times the gradient of the blocks `params.regime` trains, read off the
+    /// same pre-update parameters.
+    fn parameters_after(system: &TinyNn, params: &Params, seed: u64, steps: usize) -> Parameters {
+        let mut parameters = system
+            .initial_parameters(params, seed)
+            .expect("initial_parameters");
+        for _ in 0..steps {
+            let gradients = system
+                .gradients(&parameters, params.activation, params.regime)
+                .expect("gradients");
+            let weight_update = gradients.weight() * params.learning_rate;
+            let embedding_update = gradients
+                .embedding()
+                .map(|gradient| gradient * params.learning_rate);
+            parameters.weight -= &weight_update;
+            if let Some(update) = &embedding_update {
+                parameters.embedding -= update;
+            }
+        }
+        parameters
+    }
+
+    /// Prints [`off_diagonal_correlation`] between the model's distribution at
+    /// `run`'s memorization step and the target D⁻¹A, recomputing that
+    /// distribution from the same seed through [`parameters_after`]. Pins the
+    /// replay to the run bit-for-bit through the recorded loss, and floors the
+    /// correlation at 0.9 so the 0.9419–0.9756 the CHANGELOG quotes cannot
+    /// drift silently.
+    fn print_hit_step_correlation(
+        label: &str,
+        graph: &Graph,
+        params: &Params,
+        seed: u64,
+        run: &Run,
+    ) {
+        let system = TinyNn::new(graph).expect("TinyNn::new");
+        let hit = run.associative_step().unwrap_or_else(|| {
+            panic!(
+                "{label}: the top-d score never reached 1 in {} steps; it peaked at {:.6}",
+                params.max_steps,
+                run.peak_associative_score()
+            )
+        });
+        let target = transition(graph).expect("transition");
+        let parameters = parameters_after(&system, params, seed, hit);
+        let probabilities = system
+            .probabilities(&parameters, params.activation)
+            .expect("probabilities");
+        let replayed_loss = system.loss(&parameters, params.activation).expect("loss");
+        let recorded_loss = run
+            .records()
+            .iter()
+            .find(|record| record.step() == hit)
+            .expect("invariant: `associative_step` names a recorded step")
+            .loss();
+        assert!(
+            replayed_loss.to_bits() == recorded_loss.to_bits(),
+            "{label}: the replay diverges from the run at step {hit}: loss {replayed_loss:e} \
+             against the recorded {recorded_loss:e}, so the correlation below reads a state \
+             the run never visited"
+        );
+        let correlation = off_diagonal_correlation(&probabilities, &target);
+        println!(
+            "{label}: at the hit step {hit}, the off-diagonal Pearson correlation between the \
+             model's distribution and D⁻¹A is {correlation:.6}; the replayed loss matches the \
+             recorded {recorded_loss:.6} bit-for-bit",
+        );
+        assert!(
+            correlation > 0.9,
+            "{label}: the off-diagonal correlation {correlation:.6} fell below 0.9, off the \
+             0.9419–0.9756 the CHANGELOG quotes"
+        );
+    }
+
+    /// Fraction of the largest singular value below which a direction counts
+    /// as absent for [`embedding_spread`]'s numeric rank.
+    const NUMERIC_RANK_FLOOR: f64 = 1e-9;
+
+    /// Three non-degeneracy readings of an embedding.
+    struct EmbeddingSpread {
+        /// The count of singular values above [`NUMERIC_RANK_FLOOR`] times the
+        /// largest.
+        rank: usize,
+        /// The participation ratio (Σσ)²/Σσ² of the singular values, n for a
+        /// flat spectrum and 1 for a rank-one one.
+        participation: f64,
+        /// The largest row ℓ2 norm over the smallest.
+        row_norms: f64,
+    }
+
+    /// The numeric rank, participation ratio, and row-norm spread of
+    /// `embedding`, from its singular values and its row ℓ2 norms.
+    fn embedding_spread(embedding: &DMatrix<f64>) -> EmbeddingSpread {
+        let singular = embedding.singular_values();
+        let largest = singular.iter().copied().fold(0.0_f64, f64::max);
+        let rank = singular
+            .iter()
+            .filter(|&&value| value > NUMERIC_RANK_FLOOR * largest)
+            .count();
+        let total: f64 = singular.iter().sum();
+        let squares: f64 = singular.iter().map(|value| value * value).sum();
+
+        let mut widest = 0.0_f64;
+        let mut narrowest = f64::INFINITY;
+        for row in embedding.row_iter() {
+            let norm = row.norm();
+            widest = widest.max(norm);
+            narrowest = narrowest.min(norm);
+        }
+
+        EmbeddingSpread {
+            rank,
+            participation: total * total / squares,
+            row_norms: widest / narrowest,
+        }
+    }
+
     /// Figures 8, 22 and 23 through the run API. On every D-graph and every
     /// swept learning rate the learnable run's embedding stays off the
     /// Fiedler-like eigenvectors of −L, so no step meets the §4.1 criterion;
@@ -1915,6 +2089,35 @@ mod tests {
                 let label = format!("{name} at eta = {learning_rate}");
                 let run = measured_run(&label, &graph, &params);
 
+                let spread = embedding_spread(run.parameters().embedding());
+                println!(
+                    "{label}: final embedding numeric rank {} of {} rows (singular values above \
+                     {NUMERIC_RANK_FLOOR:e} times the largest), participation ratio {:.6}, \
+                     row-norm spread {:.6}",
+                    spread.rank,
+                    graph.order(),
+                    spread.participation,
+                    spread.row_norms
+                );
+                assert_eq!(
+                    spread.rank,
+                    graph.order(),
+                    "{label}: the final embedding's numeric rank fell below full, off the \
+                     rank-n reading the CHANGELOG quotes"
+                );
+                assert!(
+                    spread.participation > 10.0,
+                    "{label}: the participation ratio {:.6} fell to 10, far off the \
+                     12.6–15.2 the sweep prints and the CHANGELOG quotes",
+                    spread.participation
+                );
+                assert!(
+                    spread.row_norms < 1.5,
+                    "{label}: the row-norm spread {:.6} reached 1.5, off the ≤ 1.22 the \
+                     CHANGELOG quotes at η = 0.1",
+                    spread.row_norms
+                );
+
                 let peak = run.peak_alignment();
                 assert!(
                     peak < FIEDLER_ALIGNMENT,
@@ -1933,6 +2136,11 @@ mod tests {
                     .expect("a run records its initial state")
                     .fiedler_alignment();
                 let first = run.records()[0].fiedler_alignment();
+                println!(
+                    "{label}: the alignment moved {:.6} over the run, from {first:.6} to \
+                     {last:.6}",
+                    (last - first).abs()
+                );
                 assert!(
                     (last - first).abs() > ALIGNMENT_DRIFT,
                     "{label}: the alignment moved from {first:.6} to {last:.6}, less than \
@@ -1984,6 +2192,41 @@ mod tests {
                 ..Params::default()
             };
             let run = measured_run(&format!("{name} frozen"), &graph, &params);
+            print_hit_step_correlation(
+                &format!("{name} frozen seed {SEED}"),
+                &graph,
+                &params,
+                SEED,
+                &run,
+            );
+            let second = measured_run_at(
+                &format!("{name} frozen seed {SECOND_SEED}"),
+                &graph,
+                &params,
+                SECOND_SEED,
+            );
+            print_hit_step_correlation(
+                &format!("{name} frozen seed {SECOND_SEED}"),
+                &graph,
+                &params,
+                SECOND_SEED,
+                &second,
+            );
+
+            for (seed, frozen) in [(SEED, &run), (SECOND_SEED, &second)] {
+                assert_eq!(
+                    frozen.associative_step(),
+                    Some(1),
+                    "{name}: the frozen run at seed {seed} did not memorize at step 1, so \
+                     the both-seeds step-1 sentence in the CHANGELOG does not hold"
+                );
+                assert!(
+                    frozen.records()[0].associative_score() < 1.0,
+                    "{name}: the seed-{seed} draw scores {:.6} before the first update, so \
+                     the step-1 pin above measures nothing",
+                    frozen.records()[0].associative_score()
+                );
+            }
 
             assert!(
                 run.peak_associative_score() >= 1.0 - FULL_MEMORIZATION_SLACK,
