@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rayon::prelude::*;
 use rediscovery::graph::Graph;
 use rediscovery::node2vec::Outcome;
 use rediscovery::subsystems::runner::Runner;
@@ -49,6 +50,11 @@ const TRAJECTORY_STEPS: usize = 25;
 
 /// Applied updates before the cancellation test signals its token.
 const POLLS_BEFORE_CANCEL: usize = 5;
+
+/// Worker threads the sweep's own rayon pool runs, bounding how many runs of
+/// [`the_associative_fit_completes_while_the_geometry_never_forms`] are in
+/// flight at once.
+const SWEEP_THREADS: usize = 6;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -285,11 +291,32 @@ fn the_same_seed_reproduces_a_trajectory_bit_for_bit() {
 /// [`TIMING_SEEDS`]: memorization at steps 1–51, budget-to-memorization
 /// ratios 23.5–100.0, and peak alignments 0.031352–0.499665 against the 0.75
 /// criterion.
+///
+/// The 24 configurations run on a [`SWEEP_THREADS`]-worker rayon pool, each run
+/// internally sequential and drawing from its own seeded stream. Each returns
+/// its measurement line, printed in configuration order once the pool is done.
 #[test]
 fn the_associative_fit_completes_while_the_geometry_never_forms() {
-    for seed in TIMING_SEEDS {
-        for (name, graph) in d_graphs() {
-            for (learning_rate, budget) in GEOMETRIC_SWEEP {
+    let graphs = d_graphs();
+    let configurations: Vec<(u64, &str, &Graph, f64, usize)> = TIMING_SEEDS
+        .into_iter()
+        .flat_map(|seed| {
+            graphs.iter().flat_map(move |(name, graph)| {
+                GEOMETRIC_SWEEP
+                    .into_iter()
+                    .map(move |(learning_rate, budget)| (seed, *name, graph, learning_rate, budget))
+            })
+        })
+        .collect();
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(SWEEP_THREADS)
+        .build()
+        .expect("a rayon pool of SWEEP_THREADS workers");
+    let reports: Vec<String> = pool.install(|| {
+        configurations
+            .par_iter()
+            .map(|&(seed, name, graph, learning_rate, budget)| {
                 let params = Params {
                     learning_rate,
                     max_steps: budget,
@@ -298,7 +325,7 @@ fn the_associative_fit_completes_while_the_geometry_never_forms() {
                 };
                 let paths = RunPaths::new("timing");
                 let started = Instant::now();
-                let run = run_into(&graph, &params, seed, &paths);
+                let run = run_into(graph, &params, seed, &paths);
                 let label = format!("{name} at eta = {learning_rate}, seed {seed}");
 
                 let associative_step = run.associative_step().unwrap_or_else(|| {
@@ -319,7 +346,7 @@ fn the_associative_fit_completes_while_the_geometry_never_forms() {
                     reason = "step counts here are below 2^53 and exact in f64"
                 )]
                 let ratio = budget as f64 / associative_step as f64;
-                println!(
+                let report = format!(
                     "{label}: {:?}, memorization at step {associative_step}, budget {budget} \
                      (ratio {ratio:.1}), alignment step {:?} (peak {:.6}, initial {:.6}), \
                      peak shell separation {:.6}",
@@ -343,8 +370,13 @@ fn the_associative_fit_completes_while_the_geometry_never_forms() {
                      step {associative_step}, below the pinned {TIMING_FLOOR}, so the null \
                      above bounds the geometry step by less than that factor"
                 );
-            }
-        }
+                report
+            })
+            .collect()
+    });
+
+    for report in reports {
+        println!("{report}");
     }
 }
 
