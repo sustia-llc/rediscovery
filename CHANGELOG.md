@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Tier 2 `TinyNn::gradients_of` computes its two transposed-side products as
+  `A.transpose() * B` instead of `A.tr_mul(B)`, routing them through
+  nalgebra's gemm path rather than its per-entry column-dot loop
+  (`xx_mul_to_uninit`) (#6). Max entrywise difference between the two forms
+  ≤ 2.3e-16 over the committed budgets (measured in the #6 review, recorded
+  in its closing comment); a 74-run two-arm A/B over the
+  committed budgets moved no discrete event (memorization steps, alignment
+  steps, outcomes) and no quoted Findings value at its quoted precision,
+  with drift above 1e-11 confined to the η = 0.1 × 2000-step example runs.
+  Measured on one machine: 13.3 → 7.0 ms per learnable step; under
+  `cargo test`, the tier-2 integration binary 140.8 → 69.5 s and the lib
+  binary 93.2 → 38.7 s. Three Findings values below are restated from new
+  test-printed instruments where the original quote lacked a reproducing
+  one: the hit-step correlation, the η = 0.1 non-degeneracy figures, and
+  the Figure-23 shell profile.
+
 ### Added
 
 - Tier 2 `TinyNn`: the §B.2.2 model as Z = E W Eᵀ with a tied 512-wide
@@ -50,8 +68,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Refutation 3c's associative half reproduces.** The frozen regime reaches
   its maximum top-d(u) neighbour score at **step 1** on all four graphs and
   both seeds, inside the paper's two steps. Initial scores 0.089–0.221 and
-  0.078–0.167; correlation between the model's distribution and D⁻¹A is
-  0.974–0.981 at the hit step. Memorization steps in the learnable regime run
+  0.078–0.167; the Pearson correlation over the off-diagonal entries between
+  the model's distribution and D⁻¹A at the hit step is 0.9419–0.9756, printed
+  per graph and seed by the frozen-run test. Memorization steps in the learnable regime run
   1–51 across the sweep. No timing *ratio* is claimed: only one of the two
   events occurs, so the pin asserts the memorization step, the alignment null,
   and a budget floor of 10× the memorization step against a measured minimum
@@ -72,17 +91,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rate can be "too aggressive to create" what a smaller one creates later.
   §B.3 instead specifies AdamW with weight decay and a cosine schedule; the
   implementation follows the captions. The η = 0.1 embedding is not
-  degenerate (numeric rank = n, effective rank 9.9–12.3, row-norm spread
-  ≤ 1.34). Restated under the spectral measure: η = 0.1 gives the highest
-  peak alignment on three of four graphs in the 2000-step sweep, and is 0.019
-  below η = 0.01 on the cycle — so it is not the rate that fails to form
-  structure. This finding survived the retraction: it rests on the
+  degenerate: numeric rank = n on every sweep run; at η = 0.1 the
+  singular-value participation ratio is 12.6–14.7 and the row-norm spread
+  ≤ 1.22 — printed per run by the learnable-sweep test. Restated under the spectral measure: on the
+  timing-sweep budgets at seed 42, η = 0.1 gives the highest peak alignment
+  on three of four graphs and sits 0.019 below η = 0.01 on the cycle; on the
+  2000-step example sweep it wins two of four — so it is not the rate that
+  fails to form structure. This finding survived the retraction: it rests on the
   trajectory, not on the criterion.
 - **Figure 23's "gradual decrease in similarity" does not hold for this
   architecture, and the deviation is larger than first reported.** Over the
   full diameter the distance-2 mean is the global maximum on every graph
-  (cycle η = 0.001: −0.169, **+0.379**, −0.098, −0.088, −0.083, −0.184,
-  −0.136), not a decay. Node2Vec on the same graphs is monotone throughout
+  (cycle η = 0.001 at 1200 steps: −0.163, **+0.348**, −0.096, −0.071,
+  −0.081, −0.159, −0.125, printed by the learnable-sweep test), not a decay.
+  Node2Vec on the same graphs is monotone throughout
   (cycle +0.962 → +0.121 across d1..d7), which is the contrast the paper
   draws.
 - **A diverged run could report a geometry** under the retracted measure: at
