@@ -52,9 +52,6 @@ pub enum Error {
     #[error("embedding dimension must be at least 1, got {dimension}")]
     InvalidDimension { dimension: usize },
 
-    #[error("a {rows}×{columns} embedding is beyond the representable range")]
-    EmbeddingTooLarge { rows: usize, columns: usize },
-
     #[error("embedding has {rows} rows but the graph has {order} vertices")]
     EmbeddingOrderMismatch { rows: usize, order: usize },
 
@@ -66,6 +63,19 @@ pub enum Error {
 
     #[error("run parameter `max_steps` must be at least 1, got 0")]
     ZeroMaxSteps,
+
+    #[error("a {rows}×{columns} matrix is beyond the representable range")]
+    MatrixTooLarge { rows: usize, columns: usize },
+
+    #[error("weight matrix is {rows}×{columns}, expected {width}×{width}")]
+    WeightShapeMismatch {
+        rows: usize,
+        columns: usize,
+        width: usize,
+    },
+
+    #[error("graph has vertex pairs at only {available} of the required distinct distances")]
+    InsufficientDistanceShells { available: usize },
 }
 
 /// Crate-wide result alias over [`Error`].

@@ -15,6 +15,15 @@ Node2Vec model (right). The right two columns are what this POC replicates.*
 
 ## Status
 
+All three POC tiers are implemented: `graph`/`spectral` (Tier 0),
+`node2vec` (Tier 1, Appendix F dynamics), and `tinynn` (Tier 2, the §B.2.2
+associative-vs-geometric competition), with `numerics`/`output` holding what
+the tiers share. Measured findings — including where the implementation
+reproduces the paper's figures but not their captions — are recorded under
+Findings in [`CHANGELOG.md`](CHANGELOG.md).
+
+### Tier 0
+
 Tier 0 is implemented: `graph` builds the paper's tiny topologies (path-star,
 grid, cycle, irregular, tree-star, complete) over dense nalgebra adjacency,
 and `spectral` provides the row-normalized transition matrix D⁻¹A, the

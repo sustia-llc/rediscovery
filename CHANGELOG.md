@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Tier 2 `TinyNn`: the §B.2.2 model as Z = E W Eᵀ with a tied 512-wide
+  embedding and one trainable weight matrix, in frozen-E (associative) and
+  learnable-E (geometric) regimes over the same degree-normalized
+  cross-entropy Tier 1 uses. Hand-derived gradients FD-checked per parameter
+  block, a GELU variant, per-step CSV instrumentation, cosine and adjacency
+  heatmaps, and `examples/tier2_tinynn.rs`. New `numerics` and `output`
+  modules hold the softmax, log-sum-exp, cross-entropy, seeded Gaussian draw
+  and matrix-CSV writer that Tiers 1 and 2 share.
+
+### Findings (Tier 2)
+
+- **Refutation 3c reproduces.** The frozen regime reaches its maximum
+  top-d(u) neighbour score at **step 1** on all four graphs and both seeds,
+  inside the paper's two steps, while a geometry needs 554–743 steps at
+  η = 0.001 — a ratio of 743 on the 15-cycle. The same asymmetry holds
+  inside a single learnable run (memorization at step 15–29, geometry at
+  605–743, a ratio of 49.5 on the cycle).
+- **The ≤2-step result depends on an initializer the paper does not state.**
+  At `weight_sigma = 1/√m` it takes 5–10 steps; at `embedding_sigma = 1.0` it
+  does not arrive within 20. The committed default (E ~ N(0,1/m),
+  W ~ N(0,1/m²)) is the near-orthogonal-embedding setting the one-step
+  argument is derived at, and is a documented guess.
+- **Figure 22's "η = 0.1 is too aggressive to create the geometry" did not
+  reproduce.** At η = 0.1 the criterion is met earliest (7–9 steps) with an
+  equal-or-larger peak margin than the smaller rates reach.
+- **Figure 23's "gradual decrease in similarity" does not hold for this
+  architecture.** The learned shell profile is non-monotone on all four
+  graphs — distance-2 pairs carry the highest mean cosine (cycle at η = 0.01:
+  −0.102 / +0.389 / −0.198) — which is why the geometry criterion measures
+  the deepest shell's distance from zero rather than monotone decay.
+- The geometry criterion is this POC's own definition; the paper states none.
+  An adjacency-row embedding scores exactly zero on it.
+
+### Added
+
 - Tier 1 `Node2Vec` dynamics: the 1-hop weight-tied system of Appendix F —
   the Eq-1 objective with the self term in the softmax denominator,
   P = row_softmax(VVᵀ), and Lemma 6's step ΔV = ηCV with
