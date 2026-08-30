@@ -58,13 +58,14 @@ pub enum Error {
     #[error("embedding has {rows} rows but the graph has {order} vertices")]
     EmbeddingOrderMismatch { rows: usize, order: usize },
 
-    #[error("embeddings differ in shape: {rows}×{columns} against {other_rows}×{other_columns}")]
+    #[error("embedding factors differ in width: {columns} against {other_columns}")]
     EmbeddingShapeMismatch {
-        rows: usize,
         columns: usize,
-        other_rows: usize,
         other_columns: usize,
     },
+
+    #[error("run parameter `max_steps` must be at least 1, got 0")]
+    ZeroMaxSteps,
 }
 
 /// Crate-wide result alias over [`Error`].

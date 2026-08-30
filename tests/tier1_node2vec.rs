@@ -12,7 +12,7 @@
 )]
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rediscovery::graph::Graph;
@@ -26,6 +26,9 @@ const RUN_BOUND: Duration = Duration::from_secs(5);
 /// Steps the determinism pin compares, enough for the softmax non-linearity
 /// to make a seed difference visible.
 const TRAJECTORY_STEPS: usize = 25;
+
+/// Applied updates before the cancellation test signals its token.
+const POLLS_BEFORE_CANCEL: usize = 5;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -276,7 +279,8 @@ fn the_cycle_signature_holds_through_the_public_api() {
     let started = Instant::now();
     let run = run_into(&graph, &params, 20_260_829, temp.path());
     let record = run.last().expect("a run records its initial state");
-    let fiedler = node2vec::fiedler_like_range(run.spectrum());
+    let fiedler =
+        node2vec::fiedler_like_range(run.spectrum(), node2vec::fiedler_spread(run.spectrum()));
 
     println!(
         "the_cycle_signature_holds_through_the_public_api: {:?}, outcome {:?}, {} steps, \
@@ -308,12 +312,12 @@ fn the_cycle_signature_holds_through_the_public_api() {
     }
 }
 
-/// A `Runner`-driven run stops when its child token is cancelled and leaves a
-/// CSV of a header plus complete rows. Cancellation is signalled immediately
-/// after the spawn, so the run observes it at its first poll whichever order
-/// the two land in; `max_steps` is set far above what [`RUN_BOUND`] allows, so
-/// a run that never polled the token would exhaust the bound instead of
-/// returning.
+/// A `Runner`-driven run stops mid-sweep when its child token is cancelled
+/// and leaves a CSV of a header plus complete rows whose last row describes
+/// the state the run returns. The token is cancelled once the run reports
+/// [`POLLS_BEFORE_CANCEL`] polls, so the stop lands strictly inside the run;
+/// `max_steps` is set far above what [`RUN_BOUND`] allows, so a run that
+/// never polled the token would exhaust the bound instead of returning.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancelled_run_stops_and_leaves_a_well_formed_csv() {
     let temp = TempPath::new("cancellation");
@@ -327,9 +331,15 @@ async fn a_cancelled_run_stops_and_leaves_a_well_formed_csv() {
     let runner = Runner::new();
     let handle = runner.spawn(move |token| async move {
         let graph = Graph::cycle(15).expect("cycle(15)");
-        node2vec::run_tied(&graph, &params, 20_260_829, &path, || token.is_cancelled())
+        let polls = AtomicUsize::new(0);
+        node2vec::run_tied(&graph, &params, 20_260_829, &path, || {
+            let seen = polls.fetch_add(1, AtomicOrdering::SeqCst);
+            if seen == POLLS_BEFORE_CANCEL {
+                token.cancel();
+            }
+            token.is_cancelled()
+        })
     });
-    runner.cancellation_token().cancel();
 
     let run = tokio::time::timeout(RUN_BOUND, handle)
         .await
@@ -344,12 +354,26 @@ async fn a_cancelled_run_stops_and_leaves_a_well_formed_csv() {
         run.outcome(),
         run.steps()
     );
-    assert!(
-        run.steps() >= 1 && run.steps() < params.max_steps,
-        "the run applied {} of at most {} updates; cancellation should land strictly inside \
-         that range",
+    assert_eq!(
         run.steps(),
-        params.max_steps
+        POLLS_BEFORE_CANCEL,
+        "the run applied {} updates, expected {POLLS_BEFORE_CANCEL} before the cancel",
+        run.steps()
+    );
+
+    // The returned state is the one the last record describes: the stop is
+    // taken before the pending update is applied.
+    let graph = Graph::cycle(15).expect("cycle(15)");
+    let system = node2vec::Node2Vec::new(&graph).expect("system");
+    let objective = system.objective(run.embedding()).expect("objective");
+    let recorded = run
+        .last()
+        .expect("a run records its initial state")
+        .objective();
+    assert!(
+        (objective - recorded).abs() < 1e-12,
+        "the returned embedding scores {objective:.12} but the last record says \
+         {recorded:.12}; a stopped run must return the state it recorded"
     );
 
     let rows = read_rows(temp.path());

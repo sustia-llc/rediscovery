@@ -5,11 +5,11 @@
 //! eigenvector projections ‖Vᵀe_i‖₂ (panel b left/middle), the coefficient
 //! norms ‖Ce_i‖₂ (panel b right), the objective, the Observation-8 residual,
 //! and the Remark-5 degenerate projection in column `projection_0`. The runs
-//! execute as one `Runner` job that polls its child token between steps, so
-//! ctrl-c drains through `Runner::shutdown` and leaves complete CSV rows.
-//!
-//! This binary is where `SETTINGS` is read; the library API takes the output
-//! path and seed explicitly (decision D8).
+//! are synchronous numerics, so the `Runner` job hands them to
+//! `spawn_blocking` and polls its child token between steps; ctrl-c drains
+//! through `Runner::shutdown` and leaves complete CSV rows. The output
+//! directory and seed come from `SETTINGS` here and reach the library as
+//! explicit arguments (decision D8).
 
 #![allow(
     clippy::doc_markdown,
@@ -47,28 +47,34 @@ async fn main() -> Result<()> {
 
     let runner = Runner::new();
     let handle = runner.spawn(move |token| async move {
-        for (stem, graph) in graphs {
-            if token.is_cancelled() {
-                tracing::warn!(graph = stem, "cancelled before starting this graph");
-                break;
-            }
+        // The runs are CPU-bound and synchronous; spawn_blocking keeps them
+        // off the runtime's worker threads.
+        tokio::task::spawn_blocking(move || {
+            for (stem, graph) in graphs {
+                if token.is_cancelled() {
+                    tracing::warn!(graph = stem, "cancelled before starting this graph");
+                    break;
+                }
 
-            let path = directory.join(format!("tier1_fig9_{stem}.csv"));
-            let run = node2vec::run_tied(&graph, &params, seed, &path, || token.is_cancelled())?;
-            tracing::info!(
-                graph = stem,
-                steps = run.steps(),
-                outcome = ?run.outcome(),
-                rows = run.records().len(),
-                path = %path.display(),
-                "wrote Fig. 9 instrumentation"
-            );
-        }
-        Ok::<(), Error>(())
+                let path = directory.join(format!("tier1_fig9_{stem}.csv"));
+                let run =
+                    node2vec::run_tied(&graph, &params, seed, &path, || token.is_cancelled())?;
+                tracing::info!(
+                    graph = stem,
+                    steps = run.steps(),
+                    outcome = ?run.outcome(),
+                    rows = run.records().len(),
+                    path = %path.display(),
+                    "wrote Fig. 9 instrumentation"
+                );
+            }
+            Ok::<(), Error>(())
+        })
+        .await
     });
 
     tokio::select! {
-        result = handle => result??,
+        result = handle => result???,
         result = tokio::signal::ctrl_c() => {
             result?;
             tracing::info!("ctrl-c received, cancelling the run.");
