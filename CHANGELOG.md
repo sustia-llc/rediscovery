@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Tier 1 `Node2Vec` dynamics: the 1-hop weight-tied system of Appendix F —
+  the Eq-1 objective with the self term in the softmax denominator,
+  P = row_softmax(VVᵀ), and Lemma 6's step ΔV = ηCV with
+  C = (W − P) + (W − P)ᵀ — plus the weight-untied variant, seeded ChaCha
+  initialization, cancellation-aware runs, per-step CSV instrumentation
+  (eigenvector projections, coefficient norms, objective, Observation-8
+  subspace residual), node-node cosine dumps, and `examples/tier1_fig9.rs`.
+  Both gradients are pinned by central finite differences.
+
+### Findings (Tier 1)
+
+- **Lemma 6's sign is correct and the text's Proposition-7 restatement is
+  not.** Flipping C to +(P + Pᵀ) takes the finite-difference deviation to
+  7.27 against a 1e-7 tolerance.
+- **The 15-cycle reproduces Figure 9 in full**: converged at step 15 855,
+  projection separation ≈ 4.1e4, ‖Ce_i‖₂ 5.0e-7 on the Fiedler pair,
+  Observation-8 residual 4.9e-6.
+- **On the path-star and grid the coefficient norm does not reach zero on
+  the Fiedler-like set, and the implementation matches the paper's own
+  plotted panels while doing so.** Measured 1.587e-1 (path-star, set 1..4)
+  and 6.406e-2 (grid, set 1..3) at 10 000 steps, rising with training to a
+  fixed point (path-star 1.790e-1 at 1e6 steps, byte-stable at 2e6) and
+  unchanged across η ∈ {0.001, 0.01, 0.1}, σ ∈ {1, 4}, m ∈ {100, 400}, and a
+  different initialization draw. The paper's Figure 9 path-star panel plots
+  the same plateau (peak ≈0.3 near epoch 100, settling ≈0.15), so the
+  caption's "converges to 0" over-claims relative to its own figure. Two
+  `#[ignore]`d tests carry the measurements.
+- **Observation 8 holds only on the circulant graph.** Residual 4.9e-6 on
+  the 15-cycle against 0.25 (grid), 0.42 (path-star) and 0.22 (irregular) at
+  10 000 steps, all three growing with further training. Degree-regularity
+  alone does not explain the split: a 3-regular non-vertex-transitive graph
+  also misses the condition (5.5e-2 at 1e5 steps, rising).
+- **Proposition 7's shared-eigenvector claim fails numerically off the
+  circulant graph.** On the irregular graph 99.6% of ‖Ce_0‖₂ is C's
+  eigenvector rotating away from −L's, not its eigenvalue approaching zero —
+  a different failure from the one Appendix F.2's narrative assumes. Both
+  quantities are exactly zero at initialization, confirming Fact 1 to 4.8e-15.
+- **The disconnected graph needs the projection claim read per component**:
+  its two components contribute two near-null eigenvalues whose eigenvectors
+  are the component indicators, followed by the two components' Fiedler
+  vectors, so the single-degenerate-group definition of "Fiedler-like" does
+  not apply to it.
+
+### Added
+
 - Tier 0 numerics: `Graph` over dense adjacency with
   `path_star`/`grid`/`cycle`/`irregular`/`tree_star`/`complete` constructors
   and a public `from_edges` builder; `spectral::transition` (D⁻¹A),

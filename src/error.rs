@@ -45,6 +45,27 @@ pub enum Error {
 
     #[error("matrix entries ({row}, {column}) and ({column}, {row}) differ")]
     NotSymmetric { row: usize, column: usize },
+
+    #[error("run parameter `{parameter}` must be positive and finite, got {value}")]
+    InvalidRunParameter { parameter: &'static str, value: f64 },
+
+    #[error("embedding dimension must be at least 1, got {dimension}")]
+    InvalidDimension { dimension: usize },
+
+    #[error("a {rows}×{columns} embedding is beyond the representable range")]
+    EmbeddingTooLarge { rows: usize, columns: usize },
+
+    #[error("embedding has {rows} rows but the graph has {order} vertices")]
+    EmbeddingOrderMismatch { rows: usize, order: usize },
+
+    #[error("embedding factors differ in width: {columns} against {other_columns}")]
+    EmbeddingShapeMismatch {
+        columns: usize,
+        other_columns: usize,
+    },
+
+    #[error("run parameter `max_steps` must be at least 1, got 0")]
+    ZeroMaxSteps,
 }
 
 /// Crate-wide result alias over [`Error`].
