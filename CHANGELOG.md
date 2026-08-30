@@ -38,8 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remainder. Calibration on all four graphs: the Laplacian Fiedler
   eigenvectors score **1.000000** and Tier-1 Node2Vec **0.980–1.000**, while a
   rank-1 Fiedler-sign embedding scores 0.289–0.409, all-rows-identical
-  0.000–0.031, and 200 Gaussian draws peak at 0.380–0.491 — a clean gap, with
-  the 0.75 threshold inside it. Against that scale the learnable TinyNN runs
+  0.000–0.031, 200 Gaussian draws peak at 0.380–0.491, and an embedding built
+  from the **bottom** eigenvectors of −L — adjacent vertices near-antipodal,
+  the structure the retracted criterion certified — scores **0.000000** on
+  every graph. A clean gap, with the 0.75 threshold inside it. Against that scale the learnable TinyNN runs
   peak at **0.031–0.513** and the alignment step is `None` in all 24 runs
   (four graphs × three rates × two seeds) and all 12 example runs. The
   architecture memorizes the edges and does not develop the spectral geometry

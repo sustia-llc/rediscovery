@@ -1543,11 +1543,22 @@ mod tests {
             }
 
             let identical = DMatrix::from_fn(system.order(), 8, |_, j| (j + 1) as f64);
+            // The most negative eigendirections of −L assign adjacent vertices
+            // opposite signs, so this embedding's neighbours are near-antipodal
+            // — the structure the retracted shell criterion certified, and the
+            // one the learnable runs loaded on.
+            let order = system.order();
+            let bottom = system
+                .spectrum()
+                .eigenvectors()
+                .columns(order - fiedler.len(), fiedler.len())
+                .into_owned();
             let measured = [
                 ("Fiedler eigenvectors", &reference),
                 ("Node2Vec (Tier 1)", tier1.embedding()),
                 ("rank-1 Fiedler sign", &fiedler_sign_embedding(&system)),
                 ("all rows identical", &identical),
+                ("bottom eigenvectors (antipodal neighbours)", &bottom),
             ]
             .map(|(label, embedding)| {
                 (
