@@ -1,17 +1,21 @@
 //! Tier 2: the TinyNN of §B.2.2 and its associative-vs-geometric competition.
 //!
 //! [`TinyNn`] holds the graph-derived quantities the passes reuse — the target
-//! distribution D⁻¹A, the adjacency matrix, the degrees, and the vertex pairs
-//! at each graph distance up to [`GEOMETRY_SHELLS`]. The model of decision D9
-//! is one wide trainable W ∈ ℝ^{m×m} between a tied embedding/unembedding
-//! E ∈ ℝ^{n×m}: the logit of v given u is E[u] W E[v]ᵀ, optionally with a GELU
-//! on the hidden state E W. [`run`] drives full-batch gradient descent on the
-//! degree-normalized cross-entropy of the bidirectional edge bigrams,
-//! recording one [`StepRecord`] per step, streaming it to a CSV, and writing
-//! the final node-node cosine matrix; [`Regime`] selects whether E is frozen
-//! (§B.2.2's associative setting) or trained alongside W (the geometric one).
-//! [`run`] takes an explicit output path and seed (decision D8,
-//! `docs/2510.26745v2-poc-analysis.md` §8).
+//! distribution D⁻¹A, the adjacency matrix, the degrees, the vertex pairs at
+//! each graph distance, and the spectrum of −L together with its Fiedler-like
+//! index set. The model of decision D9 is one wide trainable W ∈ ℝ^{m×m}
+//! between a tied embedding/unembedding E ∈ ℝ^{n×m}: the logit of v given u is
+//! E[u] W E[v]ᵀ, optionally with a GELU on the hidden state E W. [`run`]
+//! drives full-batch gradient descent on the degree-normalized cross-entropy
+//! of the bidirectional edge bigrams, recording one [`StepRecord`] per step,
+//! streaming it to a CSV, and writing the final node-node cosine matrix;
+//! [`Regime`] selects whether E is frozen (§B.2.2's associative setting) or
+//! trained alongside W (the geometric one). Each record carries two
+//! independent embedding measurements: [`TinyNn::fiedler_alignment`], which
+//! reads the §4.1 spectral geometry, and
+//! [`TinyNn::deepest_shell_separation`], which reads the deepest shell of the
+//! distance-shell cosine profile of Fig. 23. [`run`] takes an explicit output
+//! path and seed (decision D8, `docs/2510.26745v2-poc-analysis.md` §8).
 
 #![allow(
     clippy::doc_markdown,
@@ -21,38 +25,38 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::ops::Range;
 use std::path::Path;
 
 use nalgebra::DMatrix;
 
 use crate::error::{Error, Result};
 use crate::graph::Graph;
-use crate::node2vec::{Outcome, cosine_similarity, second_factor_seed};
+use crate::node2vec::{DEGENERACY_TOLERANCE, Outcome, cosine_similarity, second_factor_seed};
 use crate::numerics::{gaussian_matrix, row_softmax, weighted_log_likelihood};
 use crate::output::write_matrix_csv;
-use crate::spectral::transition;
+use crate::spectral::{Spectrum, symmetrize, transition};
 
-/// Number of graph-distance shells [`TinyNn::shell_means`] reports and
-/// [`TinyNn::new`] requires non-empty. Shell k holds the vertex pairs at
-/// distance k; the criterion itself compares the last two, so raising this
-/// deepens the pair of shells [`GEOMETRY_MARGIN`] is calibrated against.
-pub const GEOMETRY_SHELLS: usize = 3;
+/// Number of distinct graph distances [`TinyNn::new`] requires a vertex pair
+/// at, below which it returns [`Error::InsufficientDistanceShells`].
+pub const MINIMUM_DISTANCE_SHELLS: usize = 2;
 
-// Two vertices at distance 3 or more have no common neighbour, so an embedding
-// whose rows are the adjacency rows gives the deepest shell cosine 0 — the
-// reference `shell_margin` measures against
-// (`an_adjacency_row_embedding_scores_zero_on_the_deepest_shell`).
-const _: () = assert!(GEOMETRY_SHELLS >= 3);
-
-/// Geometry margin at or above which an embedding counts as geometric for
-/// [`Run::geometry_step`].
+/// Fiedler alignment at or above which an embedding counts as geometric for
+/// [`Run::alignment_step`].
 ///
-/// Measured on the four D-graphs at [`Params::default`]'s width: an
-/// adjacency-row embedding scores 0
-/// (`an_adjacency_row_embedding_scores_zero_on_the_deepest_shell`) and the
-/// learnable runs of `the_learnable_run_forms_a_geometry_at_every_swept_rate`
-/// peak between 0.096 and 0.183.
-pub const GEOMETRY_MARGIN: f64 = 0.05;
+/// Measured on the four D-graphs by
+/// `the_fiedler_alignment_calibration_separates_the_references`: the
+/// Fiedler-like eigenvectors of −L score 1.000000 and a Tier-1 `Node2Vec`
+/// embedding at D7 defaults and seed 20260829 scores 0.980406–1.000000, while
+/// a rank-1 Fiedler-sign embedding scores 0.288786–0.408585, an
+/// all-rows-identical embedding 0.000000–0.031149, and Gaussian draws at seeds
+/// 0..200 peak at 0.380369–0.491188.
+pub const FIEDLER_ALIGNMENT: f64 = 0.75;
+
+/// Fraction of ‖E‖_F² below which a principal direction of the deflated
+/// embedding counts as absent, contributing nothing to
+/// [`TinyNn::fiedler_alignment`].
+const PRINCIPAL_DIRECTION_FLOOR: f64 = 1e-12;
 
 /// Slack below 1 within which [`Run::associative_step`] reads the associative
 /// score as its maximum, absorbing the rounding of a mean of exact fractions.
@@ -286,9 +290,10 @@ struct Forward {
 
 /// The TinyNN system for one graph.
 ///
-/// Construction computes the target distribution D⁻¹A, the degrees, and the
-/// vertex pairs at each of the first [`GEOMETRY_SHELLS`] graph distances once;
-/// every forward, backward, and metric evaluation reuses them.
+/// Construction computes the target distribution D⁻¹A, the degrees, the
+/// vertex pairs at each graph distance, and the spectrum of −L with its
+/// Fiedler-like index range once; every forward, backward, and metric
+/// evaluation reuses them.
 #[derive(Debug, Clone)]
 pub struct TinyNn {
     order: usize,
@@ -296,6 +301,8 @@ pub struct TinyNn {
     adjacency: DMatrix<f64>,
     degrees: Vec<usize>,
     shells: Vec<Vec<(usize, usize)>>,
+    spectrum: Spectrum,
+    fiedler: Range<usize>,
 }
 
 impl TinyNn {
@@ -303,9 +310,10 @@ impl TinyNn {
     ///
     /// # Errors
     ///
-    /// Propagates [`transition`]'s [`Error::IsolatedVertex`] and returns
-    /// [`Error::InsufficientDistanceShells`] when `graph` has no vertex pair
-    /// at some distance below [`GEOMETRY_SHELLS`].
+    /// Propagates [`transition`]'s [`Error::IsolatedVertex`] and
+    /// [`Spectrum::of_negative_laplacian`]'s errors, and returns
+    /// [`Error::InsufficientDistanceShells`] when `graph` has vertex pairs at
+    /// fewer than [`MINIMUM_DISTANCE_SHELLS`] distinct distances.
     pub fn new(graph: &Graph) -> Result<Self> {
         let walk = transition(graph)?;
         let order = graph.order();
@@ -323,13 +331,17 @@ impl TinyNn {
                 count
             })
             .collect();
-        let shells = distance_shells(&adjacency, order)?;
+        let profile = distance_profile(&adjacency, order)?;
+        let spectrum = Spectrum::of_negative_laplacian(graph)?;
+        let fiedler = fiedler_like_set(&spectrum, profile.components);
         Ok(Self {
             order,
             walk,
             adjacency,
             degrees,
-            shells,
+            shells: profile.shells,
+            spectrum,
+            fiedler,
         })
     }
 
@@ -346,8 +358,37 @@ impl TinyNn {
         &self.walk
     }
 
+    /// The spectrum of −L the geometry measurements read.
+    #[must_use]
+    pub fn spectrum(&self) -> &Spectrum {
+        &self.spectrum
+    }
+
+    /// The Fiedler-like eigenvector index range of −L, from
+    /// [`fiedler_like_set`].
+    #[must_use]
+    pub fn fiedler_like(&self) -> Range<usize> {
+        self.fiedler.clone()
+    }
+
+    /// The eigenvector index range of −L that [`TinyNn::fiedler_alignment`]
+    /// projects out of an embedding before measuring it: everything above the
+    /// Fiedler-like set.
+    #[must_use]
+    pub fn trivial_block(&self) -> Range<usize> {
+        0..self.fiedler.start
+    }
+
+    /// The number of populated distance shells, the largest graph distance
+    /// between two vertices of one component.
+    #[must_use]
+    pub fn shell_count(&self) -> usize {
+        self.shells.len()
+    }
+
     /// The unordered vertex pairs at graph distance `distance`, for
-    /// `distance` in `1..=GEOMETRY_SHELLS`; an empty slice outside that range.
+    /// `distance` in `1..=`[`TinyNn::shell_count`]; an empty slice outside
+    /// that range.
     #[must_use]
     pub fn shell(&self, distance: usize) -> &[(usize, usize)] {
         self.shells
@@ -512,20 +553,19 @@ impl TinyNn {
         total / self.order as f64
     }
 
-    /// The mean cosine similarity over the vertex pairs at each distance
-    /// `1..=GEOMETRY_SHELLS`, in that order.
+    /// The mean of `cosines` over the vertex pairs at each distance
+    /// `1..=`[`TinyNn::shell_count`], in that order.
     ///
     /// # Panics
     ///
     /// Panics if a shell is empty. [`TinyNn::new`] returns
     /// [`Error::InsufficientDistanceShells`] rather than build a system with
     /// one, so a `TinyNn` this crate constructed has none.
-    #[must_use]
     #[allow(
         clippy::cast_precision_loss,
         reason = "pair counts are bounded by order², exact in f64 at this scale"
     )]
-    pub fn shell_means(&self, cosines: &DMatrix<f64>) -> Vec<f64> {
+    fn shell_means_of(&self, cosines: &DMatrix<f64>) -> Vec<f64> {
         self.shells
             .iter()
             .map(|pairs| {
@@ -539,66 +579,151 @@ impl TinyNn {
             .collect()
     }
 
-    /// The geometry criterion: the deepest shell's mean cosine measured by its
-    /// distance from zero, capped by its drop below the shell above it. An
-    /// adjacency-row embedding scores zero
+    /// The mean cosine similarity between rows of `embedding` over the vertex
+    /// pairs at each distance `1..=`[`TinyNn::shell_count`], in that order.
+    /// Every entry is NaN when `embedding` carries a non-finite entry.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a shell is empty. [`TinyNn::new`] returns
+    /// [`Error::InsufficientDistanceShells`] rather than build a system with
+    /// one, so a `TinyNn` this crate constructed has none.
+    #[must_use]
+    pub fn shell_means(&self, embedding: &DMatrix<f64>) -> Vec<f64> {
+        if embedding.iter().any(|entry| !entry.is_finite()) {
+            return vec![f64::NAN; self.shells.len()];
+        }
+        self.shell_means_of(&cosine_similarity(embedding))
+    }
+
+    /// The deepest distance shell's mean cosine measured by its distance from
+    /// zero, capped by its drop below the shell above it. NaN for an embedding
+    /// carrying a non-finite entry. On the four D-graphs an embedding whose
+    /// rows are the adjacency rows scores zero
     /// (`an_adjacency_row_embedding_scores_zero_on_the_deepest_shell`).
     #[must_use]
-    pub fn geometry_margin(&self, cosines: &DMatrix<f64>) -> f64 {
-        shell_margin(&self.shell_means(cosines))
+    pub fn deepest_shell_separation(&self, embedding: &DMatrix<f64>) -> f64 {
+        profile_separation(&self.shell_means(embedding))
+    }
+
+    /// The fraction of `embedding`'s leading principal directions that lie in
+    /// the Fiedler-like eigenspace of −L, the §4.1 spectral geometry.
+    ///
+    /// [`TinyNn::trivial_block`]'s eigenvectors — one per connected component,
+    /// the degenerate directions Remark 5 tracks — are projected out of the
+    /// embedding first. Of the remainder's principal directions, the
+    /// eigenvectors of its Gram matrix in descending order, the leading k are
+    /// taken, k being the width of [`TinyNn::fiedler_like`]; each contributes
+    /// its squared projection onto that eigenspace, or nothing when its share
+    /// of ‖E‖_F² falls below `PRINCIPAL_DIRECTION_FLOOR`, and the total is
+    /// divided by k. Each term is at most 1, so the value lies in [0, 1]; it
+    /// is unchanged by scaling `embedding` over the range
+    /// `the_fiedler_alignment_is_scale_invariant` measures.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::EmbeddingOrderMismatch`] when `embedding` does not
+    /// carry one row per vertex, and propagates [`Spectrum::new`]'s
+    /// [`Error::NonFinite`] when the embedding's Gram matrix leaves the finite
+    /// range.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the Fiedler-like range is bounded by the vertex count, exact in f64 at this scale"
+    )]
+    pub fn fiedler_alignment(&self, embedding: &DMatrix<f64>) -> Result<f64> {
+        self.check_rows(embedding)?;
+        let trivial = self
+            .spectrum
+            .eigenvectors()
+            .columns(0, self.fiedler.start)
+            .into_owned();
+        let deflated = embedding - &trivial * (trivial.transpose() * embedding);
+        let principal = Spectrum::new(symmetrize(&(&deflated * deflated.transpose())))?;
+
+        let fiedler = self
+            .spectrum
+            .eigenvectors()
+            .columns(self.fiedler.start, self.fiedler.len())
+            .into_owned();
+        let projected = fiedler.transpose() * principal.eigenvectors();
+        // `symmetrize` doubles the Gram, so eigenvalue j is twice the squared
+        // singular value the floor is stated against.
+        let floor = 2.0 * PRINCIPAL_DIRECTION_FLOOR * embedding.norm_squared();
+        let carried: f64 = (0..self.fiedler.len())
+            .filter(|&j| principal.eigenvalues()[j] > floor)
+            .map(|j| projected.column(j).norm_squared())
+            .sum();
+        Ok(carried / self.fiedler.len() as f64)
     }
 
     /// Rejects a parameter set whose embedding row count is not the vertex
     /// count.
     fn check_order(&self, parameters: &Parameters) -> Result<()> {
-        if parameters.embedding.nrows() == self.order {
+        self.check_rows(&parameters.embedding)
+    }
+
+    /// Rejects an embedding whose row count is not the vertex count.
+    fn check_rows(&self, embedding: &DMatrix<f64>) -> Result<()> {
+        if embedding.nrows() == self.order {
             Ok(())
         } else {
             Err(Error::EmbeddingOrderMismatch {
-                rows: parameters.embedding.nrows(),
+                rows: embedding.nrows(),
                 order: self.order,
             })
         }
     }
 }
 
-/// The geometry margin of a shell-mean profile: the deepest shell's distance
-/// from zero, capped by its drop below the shell above it. NaN for a profile
-/// carrying a NaN or shorter than two entries, so such a profile fails every
-/// threshold comparison.
-fn shell_margin(shell_means: &[f64]) -> f64 {
+/// The separation of a shell-mean profile: its last entry's distance from
+/// zero, capped by that entry's drop below the one above it. NaN for a profile
+/// shorter than two entries or carrying a non-finite one, so such a profile
+/// fails every threshold comparison.
+fn profile_separation(shell_means: &[f64]) -> f64 {
     let [.., above, deepest] = shell_means else {
         return f64::NAN;
     };
     let separation = above - deepest;
-    if deepest.is_nan() || separation.is_nan() {
-        return f64::NAN;
+    if deepest.is_finite() && separation.is_finite() {
+        deepest.abs().min(separation)
+    } else {
+        f64::NAN
     }
-    deepest.abs().min(separation)
 }
 
-/// The unordered vertex pairs at each distance `1..=GEOMETRY_SHELLS`, by
+/// What one all-pairs breadth-first sweep of a graph yields.
+struct DistanceProfile {
+    /// The unordered vertex pairs at each distance `1..=d`, `d` being the
+    /// largest graph distance between two vertices of one component.
+    shells: Vec<Vec<(usize, usize)>>,
+    /// The number of connected components.
+    components: usize,
+}
+
+/// The distance shells and connected-component count of `adjacency`, by
 /// breadth-first search from every vertex.
 ///
 /// # Errors
 ///
-/// Returns [`Error::InsufficientDistanceShells`] when one of those shells is
-/// empty, reporting how many leading shells are populated.
-fn distance_shells(adjacency: &DMatrix<f64>, order: usize) -> Result<Vec<Vec<(usize, usize)>>> {
-    let mut shells: Vec<Vec<(usize, usize)>> = vec![Vec::new(); GEOMETRY_SHELLS];
+/// Returns [`Error::InsufficientDistanceShells`] when the shell count is below
+/// [`MINIMUM_DISTANCE_SHELLS`], reporting it.
+fn distance_profile(adjacency: &DMatrix<f64>, order: usize) -> Result<DistanceProfile> {
+    let mut shells: Vec<Vec<(usize, usize)>> = Vec::new();
+    let mut components = 0_usize;
+    let mut visited = vec![false; order];
     let mut distance = vec![usize::MAX; order];
     let mut queue = VecDeque::with_capacity(order);
 
     for source in 0..order {
+        if !visited[source] {
+            components += 1;
+        }
         distance.fill(usize::MAX);
         distance[source] = 0;
         queue.clear();
         queue.push_back(source);
         while let Some(vertex) = queue.pop_front() {
             let next = distance[vertex] + 1;
-            if next > GEOMETRY_SHELLS {
-                continue;
-            }
             for other in 0..order {
                 if adjacency[(vertex, other)] > 0.0 && distance[other] == usize::MAX {
                     distance[other] = next;
@@ -606,18 +731,50 @@ fn distance_shells(adjacency: &DMatrix<f64>, order: usize) -> Result<Vec<Vec<(us
                 }
             }
         }
-        for (other, &reached) in distance.iter().enumerate().skip(source + 1) {
-            if (1..=GEOMETRY_SHELLS).contains(&reached) {
-                shells[reached - 1].push((source, other));
+        for (other, &reached) in distance.iter().enumerate() {
+            if reached == usize::MAX {
+                continue;
             }
+            visited[other] = true;
+            if other <= source {
+                continue;
+            }
+            if shells.len() < reached {
+                shells.resize(reached, Vec::new());
+            }
+            shells[reached - 1].push((source, other));
         }
     }
 
-    let available = shells.iter().take_while(|pairs| !pairs.is_empty()).count();
-    if available < GEOMETRY_SHELLS {
-        return Err(Error::InsufficientDistanceShells { available });
+    if shells.len() < MINIMUM_DISTANCE_SHELLS {
+        return Err(Error::InsufficientDistanceShells {
+            available: shells.len(),
+        });
     }
-    Ok(shells)
+    Ok(DistanceProfile { shells, components })
+}
+
+/// The Fiedler-like eigenvector indices of `spectrum` for a graph with
+/// `components` connected components: the `components` indices below the
+/// leading `components` of the spectrum, extended forward while the next
+/// eigenvalue is within [`DEGENERACY_TOLERANCE`] of the last one taken. The
+/// returned range is non-empty.
+///
+/// On the three connected D-graphs it is
+/// [`crate::node2vec::fiedler_like_range`] at
+/// [`crate::node2vec::fiedler_spread`]
+/// (`the_fiedler_like_set_agrees_with_tier1_on_a_connected_graph`).
+fn fiedler_like_set(spectrum: &Spectrum, components: usize) -> Range<usize> {
+    let order = spectrum.order();
+    let start = components.min(order.saturating_sub(1));
+    let mut end = (start + components).clamp(start + 1, order);
+    while end < order
+        && (spectrum.eigenvalues()[end - 1] - spectrum.eigenvalues()[end]).abs()
+            <= DEGENERACY_TOLERANCE
+    {
+        end += 1;
+    }
+    start..end
 }
 
 /// One recorded step: the state after `step` applied updates, together with
@@ -627,7 +784,8 @@ pub struct StepRecord {
     step: usize,
     loss: f64,
     associative_score: f64,
-    geometry_margin: f64,
+    fiedler_alignment: f64,
+    deepest_shell_separation: f64,
     relative_update: f64,
     shell_means: Vec<f64>,
 }
@@ -651,10 +809,16 @@ impl StepRecord {
         self.associative_score
     }
 
-    /// [`TinyNn::geometry_margin`] at this state.
+    /// [`TinyNn::fiedler_alignment`] at this state.
     #[must_use]
-    pub fn geometry_margin(&self) -> f64 {
-        self.geometry_margin
+    pub fn fiedler_alignment(&self) -> f64 {
+        self.fiedler_alignment
+    }
+
+    /// [`TinyNn::deepest_shell_separation`] at this state.
+    #[must_use]
+    pub fn deepest_shell_separation(&self) -> f64 {
+        self.deepest_shell_separation
     }
 
     /// (‖ΔW‖_F + ‖ΔE‖_F)/(‖W‖_F + ‖E‖_F) for the update pending from this
@@ -664,7 +828,7 @@ impl StepRecord {
         self.relative_update
     }
 
-    /// The mean cosine similarity at each distance `1..=GEOMETRY_SHELLS`.
+    /// The mean cosine similarity at each distance `1..=shell_count`.
     #[must_use]
     pub fn shell_means(&self) -> &[f64] {
         &self.shell_means
@@ -730,21 +894,30 @@ impl Run {
             .fold(f64::NEG_INFINITY, f64::max)
     }
 
-    /// The first step whose geometry margin reaches `threshold`.
+    /// The first step whose Fiedler alignment reaches `threshold`.
     #[must_use]
-    pub fn geometry_step(&self, threshold: f64) -> Option<usize> {
+    pub fn alignment_step(&self, threshold: f64) -> Option<usize> {
         self.records
             .iter()
-            .find(|record| record.geometry_margin >= threshold)
+            .find(|record| record.fiedler_alignment >= threshold)
             .map(StepRecord::step)
     }
 
-    /// The largest geometry margin over the recorded steps.
+    /// The largest Fiedler alignment over the recorded steps.
     #[must_use]
-    pub fn peak_geometry_margin(&self) -> f64 {
+    pub fn peak_alignment(&self) -> f64 {
         self.records
             .iter()
-            .map(StepRecord::geometry_margin)
+            .map(StepRecord::fiedler_alignment)
+            .fold(f64::NEG_INFINITY, f64::max)
+    }
+
+    /// The largest deepest-shell separation over the recorded steps.
+    #[must_use]
+    pub fn peak_deepest_shell_separation(&self) -> f64 {
+        self.records
+            .iter()
+            .map(StepRecord::deepest_shell_separation)
             .fold(f64::NEG_INFINITY, f64::max)
     }
 }
@@ -771,8 +944,9 @@ pub struct Outputs<'a> {
 ///
 /// # Errors
 ///
-/// Propagates [`TinyNn::new`]'s and [`Params::validate`]'s errors and
-/// [`Error::Io`] from creating or writing either file.
+/// Propagates [`TinyNn::new`]'s, [`Params::validate`]'s and
+/// [`TinyNn::fiedler_alignment`]'s errors and [`Error::Io`] from creating or
+/// writing either file.
 pub fn run<S: Fn() -> bool>(
     graph: &Graph,
     params: &Params,
@@ -783,12 +957,9 @@ pub fn run<S: Fn() -> bool>(
     params.validate()?;
     let system = TinyNn::new(graph)?;
     let mut parameters = system.initial_parameters(params, seed)?;
-    // Recomputed where the embedding moves; a frozen-embedding run holds one
-    // cosine matrix because its embedding never changes.
-    let mut cosines = cosine_similarity(&parameters.embedding);
 
     let mut sink = BufWriter::new(File::create(outputs.history)?);
-    write_header(&mut sink)?;
+    write_header(&mut sink, system.shell_count())?;
 
     let mut records = Vec::new();
     let mut steps = 0_usize;
@@ -803,13 +974,14 @@ pub fn run<S: Fn() -> bool>(
 
         let moved = weight_update.norm() + embedding_update.as_ref().map_or(0.0, DMatrix::norm);
         let relative_update = moved / (parameters.weight.norm() + parameters.embedding.norm());
-        let shell_means = system.shell_means(&cosines);
+        let shell_means = system.shell_means(&parameters.embedding);
 
         let record = StepRecord {
             step: steps,
             loss: system.loss_of(&forward),
             associative_score: system.associative_score(&forward.probabilities),
-            geometry_margin: shell_margin(&shell_means),
+            fiedler_alignment: system.fiedler_alignment(&parameters.embedding)?,
+            deepest_shell_separation: profile_separation(&shell_means),
             relative_update,
             shell_means,
         };
@@ -831,13 +1003,12 @@ pub fn run<S: Fn() -> bool>(
         parameters.weight -= &weight_update;
         if let Some(update) = &embedding_update {
             parameters.embedding -= update;
-            cosines = cosine_similarity(&parameters.embedding);
         }
         steps += 1;
     };
     sink.flush()?;
 
-    write_matrix_csv(outputs.cosines, &cosines)?;
+    write_matrix_csv(outputs.cosines, &cosine_similarity(&parameters.embedding))?;
 
     Ok(Run {
         parameters,
@@ -849,12 +1020,12 @@ pub fn run<S: Fn() -> bool>(
 
 /// Writes the history header: the fixed columns followed by one
 /// `shell_mean_k` per distance shell.
-fn write_header<W: Write>(sink: &mut W) -> Result<()> {
+fn write_header<W: Write>(sink: &mut W, shell_count: usize) -> Result<()> {
     write!(
         sink,
-        "step,loss,associative_score,geometry_margin,relative_update"
+        "step,loss,associative_score,fiedler_alignment,deepest_shell_separation,relative_update"
     )?;
-    for distance in 1..=GEOMETRY_SHELLS {
+    for distance in 1..=shell_count {
         write!(sink, ",shell_mean_{distance}")?;
     }
     writeln!(sink)?;
@@ -865,11 +1036,12 @@ fn write_header<W: Write>(sink: &mut W) -> Result<()> {
 fn write_row<W: Write>(sink: &mut W, record: &StepRecord) -> Result<()> {
     write!(
         sink,
-        "{},{},{},{},{}",
+        "{},{},{},{},{},{}",
         record.step,
         record.loss,
         record.associative_score,
-        record.geometry_margin,
+        record.fiedler_alignment,
+        record.deepest_shell_separation,
         record.relative_update
     )?;
     for value in &record.shell_means {
@@ -886,7 +1058,7 @@ fn write_row<W: Write>(sink: &mut W, record: &StepRecord) -> Result<()> {
 )]
 mod tests {
     use super::*;
-    use crate::node2vec::{self, Node2Vec};
+    use crate::node2vec::{self, Node2Vec, fiedler_like_range, fiedler_spread};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -1160,45 +1332,51 @@ mod tests {
         }
     }
 
-    /// The geometry margin is zero on the adjacency matrix and positive on a
-    /// cosine matrix that decays with distance, so the criterion reads the
-    /// multi-hop structure rather than the edge set.
+    /// The shell means read the distance structure of a cosine matrix rather
+    /// than its edge set: on a matrix built to hold a fixed value per shell,
+    /// every mean is that value, so the pair lists index the shells they name.
     #[test]
-    fn the_geometry_margin_separates_multi_hop_structure_from_adjacency() {
+    fn the_shell_means_read_the_value_planted_in_each_shell() {
         for (name, graph) in d_graphs() {
             let system = TinyNn::new(&graph).expect("TinyNn::new");
             let order = graph.order();
+            let shells = system.shell_count();
 
-            let adjacency_margin = system.geometry_margin(graph.adjacency());
-            assert!(
-                adjacency_margin.abs() < 1e-15,
-                "{name}: the adjacency matrix scores {adjacency_margin:.6e}, expected 0"
-            );
-
-            let mut decaying = DMatrix::<f64>::identity(order, order);
-            for distance in 1..=GEOMETRY_SHELLS {
+            let mut planted = DMatrix::<f64>::identity(order, order);
+            for distance in 1..=shells {
                 let value = 1.0 - 0.2 * distance as f64;
                 for &(u, v) in system.shell(distance) {
-                    decaying[(u, v)] = value;
-                    decaying[(v, u)] = value;
+                    planted[(u, v)] = value;
+                    planted[(v, u)] = value;
                 }
             }
-            let decaying_margin = system.geometry_margin(&decaying);
-            let expected = (1.0 - 0.2 * GEOMETRY_SHELLS as f64).abs().min(0.2);
-            assert!(
-                (decaying_margin - expected).abs() < 1e-12,
-                "{name}: a cosine matrix decaying by 0.2 per shell scores \
-                 {decaying_margin:.15}, expected {expected}"
+
+            let means = system.shell_means_of(&planted);
+            assert_eq!(
+                means.len(),
+                shells,
+                "{name}: the profile has {} entries, expected {shells}",
+                means.len()
             );
+            for (index, mean) in means.iter().enumerate() {
+                let expected = 1.0 - 0.2 * (index + 1) as f64;
+                assert!(
+                    (mean - expected).abs() < 1e-12,
+                    "{name}: shell {} has mean {mean:.15}, planted {expected:.15}",
+                    index + 1
+                );
+            }
         }
     }
 
-    /// The criterion on the profile shape the learnable runs actually reach: a
-    /// negative deepest shell below a positive one above it, where the
+    /// The separation on the profile shape the learnable runs actually reach:
+    /// a negative deepest shell below a positive one above it, where the
     /// distance-from-zero branch binds rather than the separation cap. Each
-    /// case names the branch it exercises and the value it expects.
+    /// case names the branch it exercises and the value it expects; the
+    /// non-finite cases pin that such a profile scores NaN, which fails every
+    /// threshold comparison.
     #[test]
-    fn the_geometry_margin_reads_a_negative_deepest_shell() {
+    fn the_deepest_shell_separation_reads_a_negative_deepest_shell() {
         let cases: [(&str, [f64; 3], f64); 4] = [
             // The cycle(15) profile at eta = 0.001, where |deepest| is 4.6x
             // below the separation.
@@ -1210,77 +1388,295 @@ mod tests {
             // Separation binding on the same sign pattern.
             ("separation binds", [0.0, -0.10, -0.40], 0.30),
             // A deepest shell above the one over it scores zero, not a
-            // negative margin.
+            // negative separation.
             ("inverted shells", [0.0, -0.40, -0.10], -0.30),
             // No structure at all.
             ("flat", [0.2, 0.2, 0.2], 0.0),
         ];
 
         for (label, means, expected) in cases {
-            let margin = shell_margin(&means);
+            let separation = profile_separation(&means);
             assert!(
-                (margin - expected).abs() < 1e-9,
-                "{label}: shell means {means:?} score {margin:.9}, expected {expected:.9}"
+                (separation - expected).abs() < 1e-9,
+                "{label}: shell means {means:?} score {separation:.9}, expected {expected:.9}"
             );
         }
+
+        for (label, means) in [
+            ("NaN deepest", [0.2, 0.4, f64::NAN]),
+            ("NaN above", [0.2, f64::NAN, 0.4]),
+            ("infinite deepest", [0.2, 0.4, f64::NEG_INFINITY]),
+            ("infinite above", [0.2, f64::INFINITY, 0.4]),
+        ] {
+            let separation = profile_separation(&means);
+            assert!(
+                separation.is_nan(),
+                "{label}: shell means {means:?} score {separation}, expected NaN"
+            );
+        }
+
+        let single = profile_separation(&[0.4]);
+        assert!(
+            single.is_nan(),
+            "a one-entry profile scores {single}, expected NaN"
+        );
     }
 
-    /// The associative reference the criterion measures against: an embedding
+    /// The associative reference the separation measures against: an embedding
     /// whose rows are the adjacency rows scores exactly zero on every D-graph,
     /// its deepest-shell pairs having no common neighbour. Its distance-2 mean
-    /// is printed alongside, so the zero is visibly a property of the deepest
+    /// is asserted positive alongside, so the zero is a property of the deepest
     /// shell rather than of a cosine matrix with no structure at all.
     #[test]
     fn an_adjacency_row_embedding_scores_zero_on_the_deepest_shell() {
         for (name, graph) in d_graphs() {
             let system = TinyNn::new(&graph).expect("TinyNn::new");
-            let cosines = cosine_similarity(graph.adjacency());
-            let means = system.shell_means(&cosines);
-            let margin = system.geometry_margin(&cosines);
+            let means = system.shell_means(graph.adjacency());
+            let separation = system.deepest_shell_separation(graph.adjacency());
+            let deepest = means[system.shell_count() - 1];
 
-            println!("{name}: adjacency-row shell means {means:?}, margin {margin:.6}");
+            println!("{name}: adjacency-row shell means {means:?}, separation {separation:.6}");
             assert!(
-                means[GEOMETRY_SHELLS - 1].abs() < 1e-15,
-                "{name}: the adjacency-row embedding's distance-{GEOMETRY_SHELLS} mean is \
-                 {:.6e}, expected 0",
-                means[GEOMETRY_SHELLS - 1]
+                deepest.abs() < 1e-15,
+                "{name}: the adjacency-row embedding's distance-{} mean is {deepest:.6e}, \
+                 expected 0",
+                system.shell_count()
             );
             assert!(
-                margin.abs() < 1e-15,
-                "{name}: the adjacency-row embedding scores {margin:.6e}, expected 0"
+                separation.abs() < 1e-15,
+                "{name}: the adjacency-row embedding scores {separation:.6e}, expected 0"
             );
             assert!(
-                means[GEOMETRY_SHELLS - 2] > 0.1,
-                "{name}: the adjacency-row embedding's distance-{} mean is {:.6}, so the zero \
+                means[1] > 0.1,
+                "{name}: the adjacency-row embedding's distance-2 mean is {:.6}, so the zero \
                  above would hold for a cosine matrix with no shell structure at all",
-                GEOMETRY_SHELLS - 1,
-                means[GEOMETRY_SHELLS - 2]
+                means[1]
             );
         }
     }
 
-    /// A cosine matrix that left the finite range scores NaN, which fails
-    /// every threshold comparison — a diverged run cannot report a geometry.
+    /// An embedding that left the finite range scores NaN on the shell
+    /// separation and is a typed error on the Fiedler alignment — a diverged
+    /// run cannot report a geometry through either instrument. The finite
+    /// embedding beside it scores a number through both, so the guards are not
+    /// firing on every input.
     #[test]
-    fn a_non_finite_cosine_matrix_scores_nan() {
+    fn a_non_finite_embedding_cannot_report_a_geometry() {
         let graph = Graph::cycle(15).expect("cycle(15)");
         let system = TinyNn::new(&graph).expect("TinyNn::new");
-        let broken = DMatrix::from_element(15, 15, f64::NAN);
 
-        let margin = system.geometry_margin(&broken);
+        for (label, entry) in [("NaN", f64::NAN), ("infinite", f64::INFINITY)] {
+            let broken = DMatrix::from_element(15, 4, entry);
+            let separation = system.deepest_shell_separation(&broken);
+            assert!(
+                separation.is_nan(),
+                "{label}: the shell separation is {separation}, expected NaN"
+            );
+            assert!(
+                separation.partial_cmp(&0.0).is_none(),
+                "{label}: a NaN separation orders against 0 as {:?}",
+                separation.partial_cmp(&0.0)
+            );
+            match system.fiedler_alignment(&broken) {
+                Err(Error::NonFinite { .. }) => {}
+                other => panic!("{label}: expected NonFinite, got {other:?}"),
+            }
+        }
+
+        let finite = cosine_similarity(graph.adjacency());
         assert!(
-            margin.is_nan(),
-            "a NaN cosine matrix scores {margin}, expected NaN"
+            system.deepest_shell_separation(&finite).is_finite(),
+            "a finite embedding scores NaN on the shell separation, so the guard above fires \
+             on every input"
         );
         assert!(
-            margin.partial_cmp(&GEOMETRY_MARGIN).is_none(),
-            "a NaN margin orders against the {GEOMETRY_MARGIN} threshold as {:?}",
-            margin.partial_cmp(&GEOMETRY_MARGIN)
+            system.fiedler_alignment(&finite).is_ok(),
+            "a finite embedding is an error on the Fiedler alignment, so the guard above fires \
+             on every input"
         );
     }
 
+    /// The embedding whose rows are `sign(e)` for the leading Fiedler-like
+    /// eigenvector `e` of `system`: rank one, and cosine ±1 on every pair.
+    fn fiedler_sign_embedding(system: &TinyNn) -> DMatrix<f64> {
+        let column = system.fiedler_like().start;
+        let fiedler = system.spectrum().eigenvectors().column(column).into_owned();
+        DMatrix::from_fn(system.order(), 1, |u, _| {
+            if fiedler[u] >= 0.0 { 1.0 } else { -1.0 }
+        })
+    }
+
+    /// Draws the calibration test's Gaussian references.
+    const GAUSSIAN_DRAWS: u64 = 200;
+
+    /// The references [`FIEDLER_ALIGNMENT`] is calibrated against, measured on
+    /// every D-graph: the Fiedler-like eigenvectors of −L and a converged
+    /// Tier-1 `Node2Vec` embedding are above the threshold, while a rank-1
+    /// Fiedler-sign embedding, an all-rows-identical embedding, and 200 raw
+    /// Gaussian draws are below it. Every measured value is printed.
+    #[test]
+    fn the_fiedler_alignment_calibration_separates_the_references() {
+        for (name, graph) in d_graphs() {
+            let system = TinyNn::new(&graph).expect("TinyNn::new");
+            let fiedler = system.fiedler_like();
+            let reference = system
+                .spectrum()
+                .eigenvectors()
+                .columns(fiedler.start, fiedler.len())
+                .into_owned();
+
+            let history = TempPath::new("calibration-tier1");
+            let tier1 = node2vec::run_tied(
+                &graph,
+                &node2vec::Params::default(),
+                SEED,
+                history.path(),
+                || false,
+            )
+            .expect("run_tied");
+
+            let mut worst_draw = 0.0_f64;
+            for seed in 0..GAUSSIAN_DRAWS {
+                let draw = gaussian_matrix(system.order(), 8, 1.0, seed).expect("gaussian_matrix");
+                let score = system.fiedler_alignment(&draw).expect("fiedler_alignment");
+                worst_draw = worst_draw.max(score);
+            }
+
+            let identical = DMatrix::from_fn(system.order(), 8, |_, j| (j + 1) as f64);
+            let measured = [
+                ("Fiedler eigenvectors", &reference),
+                ("Node2Vec (Tier 1)", tier1.embedding()),
+                ("rank-1 Fiedler sign", &fiedler_sign_embedding(&system)),
+                ("all rows identical", &identical),
+            ]
+            .map(|(label, embedding)| {
+                (
+                    label,
+                    system
+                        .fiedler_alignment(embedding)
+                        .expect("fiedler_alignment"),
+                )
+            });
+
+            println!(
+                "{name}: eigenvalues {:?}, Fiedler-like range {fiedler:?}",
+                system
+                    .spectrum()
+                    .eigenvalues()
+                    .iter()
+                    .map(|value| format!("{value:.6}"))
+                    .collect::<Vec<_>>()
+            );
+            for (label, score) in measured {
+                println!("{name}: {label} scores {score:.6}");
+            }
+            println!(
+                "{name}: {GAUSSIAN_DRAWS} Gaussian draws peak at {worst_draw:.6}, \
+                 threshold {FIEDLER_ALIGNMENT}"
+            );
+
+            for (label, score) in &measured[..2] {
+                assert!(
+                    *score >= FIEDLER_ALIGNMENT,
+                    "{name}: {label} scores {score:.6}, below the {FIEDLER_ALIGNMENT} criterion \
+                     it calibrates"
+                );
+            }
+            for (label, score) in &measured[2..] {
+                assert!(
+                    *score < FIEDLER_ALIGNMENT,
+                    "{name}: {label} scores {score:.6}, at or above the {FIEDLER_ALIGNMENT} \
+                     criterion"
+                );
+            }
+            assert!(
+                worst_draw < FIEDLER_ALIGNMENT,
+                "{name}: the highest of {GAUSSIAN_DRAWS} Gaussian draws scores \
+                 {worst_draw:.6}, at or above the {FIEDLER_ALIGNMENT} criterion"
+            );
+        }
+    }
+
+    /// The Fiedler-like set the alignment measures against agrees with Tier
+    /// 1's `fiedler_like_range` on each connected D-graph, and on the
+    /// disconnected one it is the two components' Fiedler vectors — indices
+    /// 2..4 — where `fiedler_like_range` returns 1..2, the second component's
+    /// own leading eigenvector.
+    #[test]
+    fn the_fiedler_like_set_agrees_with_tier1_on_a_connected_graph() {
+        for (name, graph) in d_graphs() {
+            let system = TinyNn::new(&graph).expect("TinyNn::new");
+            let tier1 = fiedler_like_range(system.spectrum(), fiedler_spread(system.spectrum()));
+            println!(
+                "{name}: trivial block {:?}, Fiedler-like set {:?}, Tier 1 range {tier1:?}",
+                system.trivial_block(),
+                system.fiedler_like()
+            );
+
+            if name == "irregular()" {
+                assert_eq!(
+                    system.fiedler_like(),
+                    2..4,
+                    "irregular(): the Fiedler-like set is {:?}, expected the two components' \
+                     Fiedler vectors 2..4",
+                    system.fiedler_like()
+                );
+                assert_eq!(
+                    tier1,
+                    1..2,
+                    "irregular(): Tier 1's range is {tier1:?}, expected 1..2"
+                );
+            } else {
+                assert_eq!(
+                    system.fiedler_like(),
+                    tier1,
+                    "{name}: the Fiedler-like set is {:?}, Tier 1's range is {tier1:?}",
+                    system.fiedler_like()
+                );
+                assert_eq!(
+                    system.trivial_block(),
+                    0..1,
+                    "{name}: the trivial block is {:?}, expected the single leading eigenvector \
+                     of a connected graph",
+                    system.trivial_block()
+                );
+            }
+        }
+    }
+
+    /// The alignment is unchanged by scaling the embedding over the range
+    /// 1e-120 to 1e120, where the Gram matrix stays inside f64 — so a run
+    /// whose parameters grew or shrank by many orders of magnitude is neither
+    /// rewarded nor punished for the change of scale alone.
+    #[test]
+    fn the_fiedler_alignment_is_scale_invariant() {
+        for (name, graph) in d_graphs() {
+            let system = TinyNn::new(&graph).expect("TinyNn::new");
+            let draw = gaussian_matrix(system.order(), 8, 1.0, SEED).expect("gaussian_matrix");
+            let base = system.fiedler_alignment(&draw).expect("fiedler_alignment");
+            assert!(
+                base > 0.0,
+                "{name}: the draw scores {base:.6e}, so the equalities below would hold for a \
+                 measure that is always zero"
+            );
+
+            for scale in [1e-120, 1e-6, 1e6, 1e120] {
+                let scaled = &draw * scale;
+                let score = system
+                    .fiedler_alignment(&scaled)
+                    .expect("fiedler_alignment");
+                assert!(
+                    (score - base).abs() < 1e-12,
+                    "{name}: scaling the embedding by {scale:e} moved the alignment from \
+                     {base:.15} to {score:.15}"
+                );
+            }
+        }
+    }
+
     /// Distance shell 1 is the edge set, and the 15-cycle has 15 pairs at each
-    /// of the first three distances.
+    /// of its seven distances — its whole diameter, covering all 105 vertex
+    /// pairs.
     #[test]
     fn distance_shells_match_the_edge_and_cycle_counts() {
         for (name, graph) in d_graphs() {
@@ -1292,11 +1688,24 @@ mod tests {
                 system.shell(1).len(),
                 graph.edge_count()
             );
+            println!(
+                "{name}: {} distance shells, sizes {:?}",
+                system.shell_count(),
+                (1..=system.shell_count())
+                    .map(|distance| system.shell(distance).len())
+                    .collect::<Vec<_>>()
+            );
         }
 
         let cycle = Graph::cycle(15).expect("cycle(15)");
         let system = TinyNn::new(&cycle).expect("TinyNn::new");
-        for distance in 1..=GEOMETRY_SHELLS {
+        assert_eq!(
+            system.shell_count(),
+            7,
+            "cycle(15): {} distance shells, expected the diameter 7",
+            system.shell_count()
+        );
+        for distance in 1..=system.shell_count() {
             assert_eq!(
                 system.shell(distance).len(),
                 15,
@@ -1429,9 +1838,14 @@ mod tests {
     const ASSOCIATIVE_BUDGET: usize = 200;
 
     /// Learning rates decision D10 sweeps, with the applied-update budget each
-    /// gets: above the step at which the criterion is met at that rate on the
-    /// four D-graphs.
+    /// gets: the 10²–10³ steps Figs. 8 and 22 plot.
     const GEOMETRIC_SWEEP: [(f64, usize); 3] = [(0.001, 1_200), (0.01, 200), (0.1, 50)];
+
+    /// Movement in the Fiedler alignment over a learnable run below which the
+    /// criterion is reading something other than the trained embedding. The
+    /// smallest measured move over `GEOMETRIC_SWEEP` and the four D-graphs at
+    /// seed 20260829 is 0.0309, on the 4×4 grid at η = 0.001.
+    const ALIGNMENT_DRIFT: f64 = 1e-3;
 
     /// Runs `params` on `graph` into temp files, printing the measurement.
     fn measured_run(label: &str, graph: &Graph, params: &Params) -> Run {
@@ -1446,8 +1860,9 @@ mod tests {
         let last = run.last().expect("a run records its initial state");
         println!(
             "{label}: {:?}, outcome {:?}, {} steps, loss {:.6} (was {:.6}), \
-             associative step {:?} (peak {:.6}, initial {:.6}), geometry step {:?} \
-             (peak margin {:.6}), final shell means {:?}",
+             associative step {:?} (peak {:.6}, initial {:.6}), alignment step {:?} \
+             (peak {:.6}, initial {:.6}, final {:.6}), peak shell separation {:.6}, \
+             final shell means {:?}",
             started.elapsed(),
             run.outcome(),
             run.steps(),
@@ -1456,8 +1871,11 @@ mod tests {
             run.associative_step(),
             run.peak_associative_score(),
             run.records()[0].associative_score(),
-            run.geometry_step(GEOMETRY_MARGIN),
-            run.peak_geometry_margin(),
+            run.alignment_step(FIEDLER_ALIGNMENT),
+            run.peak_alignment(),
+            run.records()[0].fiedler_alignment(),
+            last.fiedler_alignment(),
+            run.peak_deepest_shell_separation(),
             last.shell_means()
                 .iter()
                 .map(|value| format!("{value:.6}"))
@@ -1466,11 +1884,15 @@ mod tests {
         run
     }
 
-    /// Figures 8 and 22 through the run API: on every D-graph and every swept
-    /// learning rate the geometry criterion is met, and not at the draw. The
-    /// step at which it is first met is printed per graph and rate.
+    /// Figures 8, 22 and 23 through the run API. On every D-graph and every
+    /// swept learning rate the learnable run's embedding stays off the
+    /// Fiedler-like eigenvectors of −L, so no step meets the §4.1 criterion;
+    /// and its final shell profile over the whole diameter attains its
+    /// maximum at distance 2, above the distance-1 mean that Figure 23 reads
+    /// as the cosine matrix reproducing the adjacency. Both measurements are
+    /// printed per graph and rate.
     #[test]
-    fn the_learnable_run_forms_a_geometry_at_every_swept_rate() {
+    fn the_learnable_run_misses_the_geometry_and_peaks_at_distance_two() {
         for (name, graph) in d_graphs() {
             for (learning_rate, budget) in GEOMETRIC_SWEEP {
                 let params = Params {
@@ -1482,30 +1904,67 @@ mod tests {
                 let label = format!("{name} at eta = {learning_rate}");
                 let run = measured_run(&label, &graph, &params);
 
-                let step = run.geometry_step(GEOMETRY_MARGIN).unwrap_or_else(|| {
-                    panic!(
-                        "{label}: the geometry margin never reached {GEOMETRY_MARGIN} in \
-                         {budget} steps; it peaked at {:.6}",
-                        run.peak_geometry_margin()
-                    )
-                });
+                let peak = run.peak_alignment();
                 assert!(
-                    step > 0,
-                    "{label}: the draw already meets the geometry criterion at margin {:.6}, \
-                     so the step above measures nothing",
-                    run.records()[0].geometry_margin()
+                    peak < FIEDLER_ALIGNMENT,
+                    "{label}: the Fiedler alignment peaked at {peak:.6} over {budget} steps, \
+                     reaching the {FIEDLER_ALIGNMENT} criterion at step {:?}",
+                    run.alignment_step(FIEDLER_ALIGNMENT)
+                );
+                assert!(
+                    run.peak_associative_score() >= 1.0 - FULL_MEMORIZATION_SLACK,
+                    "{label}: the top-d score peaked at {:.6}, so the alignment null above is \
+                     a run that learned nothing",
+                    run.peak_associative_score()
+                );
+                let last = run
+                    .last()
+                    .expect("a run records its initial state")
+                    .fiedler_alignment();
+                let first = run.records()[0].fiedler_alignment();
+                assert!(
+                    (last - first).abs() > ALIGNMENT_DRIFT,
+                    "{label}: the alignment moved from {first:.6} to {last:.6}, less than \
+                     {ALIGNMENT_DRIFT}, so the null above would hold for a measurement that \
+                     never reads the trained embedding"
+                );
+
+                let means = run
+                    .last()
+                    .expect("a run records its initial state")
+                    .shell_means();
+                let (highest, peak_mean) = means.iter().enumerate().fold(
+                    (0_usize, f64::NEG_INFINITY),
+                    |(best, value), (index, &mean)| {
+                        if mean > value {
+                            (index, mean)
+                        } else {
+                            (best, value)
+                        }
+                    },
+                );
+                assert_eq!(
+                    highest,
+                    1,
+                    "{label}: the shell profile {means:?} peaks at distance {}, expected 2",
+                    highest + 1
+                );
+                assert!(
+                    peak_mean > means[0],
+                    "{label}: the distance-2 mean {peak_mean:.6} does not exceed the \
+                     distance-1 mean {:.6}, so the profile is consistent with Figure 23",
+                    means[0]
                 );
             }
         }
     }
 
     /// The frozen-embedding regime memorizes the edges while its embedding
-    /// stays at the draw: the top-d score reaches its maximum and the shell
-    /// profile is the one the seeded draw started with. §B.2.2 rests its
-    /// associative reading on the first half; the second is a property of the
-    /// regime — a frozen embedding cannot move — so the test pins that the
-    /// draw itself is not already geometric, which is what makes the
-    /// learnable runs' margins attributable to training.
+    /// stays at the draw: the top-d score reaches its maximum and the geometry
+    /// measurements are the ones the seeded draw started with. §B.2.2 rests
+    /// its associative reading on the first half; the second is a property of
+    /// the regime — a frozen embedding cannot move — so the test pins that the
+    /// draw itself is not already geometric.
     #[test]
     fn the_frozen_run_memorizes_without_moving_its_embedding() {
         for (name, graph) in d_graphs() {
@@ -1523,29 +1982,39 @@ mod tests {
                 run.peak_associative_score()
             );
 
-            let first = run.records()[0].geometry_margin();
-            let last = run
-                .last()
-                .expect("a run records its initial state")
-                .geometry_margin();
+            let last = run.last().expect("a run records its initial state");
+            for (measure, first, last) in [
+                (
+                    "Fiedler alignment",
+                    run.records()[0].fiedler_alignment(),
+                    last.fiedler_alignment(),
+                ),
+                (
+                    "shell separation",
+                    run.records()[0].deepest_shell_separation(),
+                    last.deepest_shell_separation(),
+                ),
+            ] {
+                assert!(
+                    (first - last).abs() < 1e-12,
+                    "{name}: the frozen run's {measure} moved from {first:.12} to {last:.12}; \
+                     a frozen embedding cannot change either measurement"
+                );
+            }
+            let first = run.records()[0].fiedler_alignment();
             assert!(
-                (first - last).abs() < 1e-12,
-                "{name}: the frozen run's margin moved from {first:.12} to {last:.12}; a frozen \
-                 embedding cannot change the cosine matrix"
-            );
-            assert!(
-                first < GEOMETRY_MARGIN,
+                first < FIEDLER_ALIGNMENT,
                 "{name}: the seeded draw already scores {first:.6} against the \
-                 {GEOMETRY_MARGIN} criterion, so the learnable runs' margins are not \
+                 {FIEDLER_ALIGNMENT} criterion, so a learnable run reaching it would not be \
                  attributable to training"
             );
         }
     }
 
-    /// The GELU variant carries the same two results on the 15-cycle: the
+    /// The GELU variant carries both Tier-2 results on the 15-cycle: the
     /// frozen run memorizes the edges within Refutation 3c's two steps, and
-    /// the learnable run at η = 0.01 forms a geometry after it. The measured
-    /// steps are printed.
+    /// the learnable run at η = 0.01 leaves the Fiedler alignment below the
+    /// criterion, as the linear variant does. The measured values are printed.
     #[test]
     fn the_gelu_variant_carries_both_results_on_the_cycle() {
         let graph = Graph::cycle(15).expect("cycle(15)");
@@ -1577,17 +2046,18 @@ mod tests {
             ..Params::default()
         };
         let geometric = measured_run("cycle(15) gelu learnable", &graph, &learnable);
-        let geometric_step = geometric.geometry_step(GEOMETRY_MARGIN).unwrap_or_else(|| {
-            panic!(
-                "cycle(15) gelu: the geometry margin never reached {GEOMETRY_MARGIN} in 200 \
-                 steps; it peaked at {:.6}",
-                geometric.peak_geometry_margin()
-            )
-        });
+        let peak = geometric.peak_alignment();
         assert!(
-            geometric_step > associative_step,
-            "cycle(15) gelu: the geometry criterion is met at step {geometric_step}, at or \
-             before the associative step {associative_step}"
+            peak < FIEDLER_ALIGNMENT,
+            "cycle(15) gelu: the Fiedler alignment peaked at {peak:.6} over 200 steps, \
+             reaching the {FIEDLER_ALIGNMENT} criterion at step {:?}",
+            geometric.alignment_step(FIEDLER_ALIGNMENT)
+        );
+        assert!(
+            geometric.peak_associative_score() >= 1.0 - FULL_MEMORIZATION_SLACK,
+            "cycle(15) gelu: the learnable run's top-d score peaked at {:.6}, so the alignment \
+             null above is a run that learned nothing",
+            geometric.peak_associative_score()
         );
     }
 }

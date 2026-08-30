@@ -3,14 +3,16 @@
 //! Per graph: one frozen-embedding run at η = 0.1 (Fig. 7's associative
 //! setting) and one learnable-embedding run per learning rate in
 //! {0.001, 0.01, 0.1} (Figs. 8 and 22), each streaming its per-step record —
-//! loss, the associative top-d score, the distance-shell cosine means, and
-//! their margin — and its final node-node cosine matrix. The graph's adjacency
-//! matrix is written alongside, giving the Fig.-23 cosine-versus-adjacency
-//! pair under edge-only supervision. The runs are synchronous numerics, so the
-//! `Runner` job hands them to `spawn_blocking` and polls its child token
-//! between steps; ctrl-c drains through `Runner::shutdown` and leaves complete
-//! CSV rows. The output directory and seed come from `SETTINGS` here and reach
-//! the library as explicit arguments (decision D8).
+//! loss, the associative top-d score, the Fiedler alignment, the
+//! distance-shell cosine means over the whole graph diameter, and their
+//! deepest-shell separation — and its final node-node cosine matrix. The
+//! graph's adjacency matrix is written alongside, giving the Fig.-23
+//! cosine-versus-adjacency pair under edge-only supervision. The runs are
+//! synchronous numerics, so the `Runner` job hands them to `spawn_blocking`
+//! and polls its child token between steps; ctrl-c drains through
+//! `Runner::shutdown` and leaves complete CSV rows. The output directory and
+//! seed come from `SETTINGS` here and reach the library as explicit arguments
+//! (decision D8).
 
 use anyhow::Result;
 
@@ -20,7 +22,7 @@ use rediscovery::logger;
 use rediscovery::output::write_matrix_csv;
 use rediscovery::settings::SETTINGS;
 use rediscovery::subsystems::runner::Runner;
-use rediscovery::tinynn::{self, GEOMETRY_MARGIN, Outputs, Params, Regime};
+use rediscovery::tinynn::{self, FIEDLER_ALIGNMENT, Outputs, Params, Regime};
 
 /// Learning rates the geometric sweep covers (decision D10).
 const LEARNING_RATES: [f64; 3] = [0.001, 0.01, 0.1];
@@ -115,8 +117,9 @@ async fn main() -> Result<()> {
                         learning_rate,
                         steps = run.steps(),
                         outcome = ?run.outcome(),
-                        geometry_step = ?run.geometry_step(GEOMETRY_MARGIN),
-                        peak_geometry_margin = run.peak_geometry_margin(),
+                        alignment_step = ?run.alignment_step(FIEDLER_ALIGNMENT),
+                        peak_alignment = run.peak_alignment(),
+                        peak_shell_separation = run.peak_deepest_shell_separation(),
                         final_shell_means = ?run.last().map(|record| record.shell_means().to_vec()),
                         "wrote the learnable-embedding run"
                     );
