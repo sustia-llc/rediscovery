@@ -10,9 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Tier 2 `TinyNn`: the §B.2.2 model as Z = E W Eᵀ with a tied 512-wide
-  embedding and one trainable weight matrix, in frozen-E (associative) and
-  learnable-E (geometric) regimes over the same degree-normalized
-  cross-entropy Tier 1 uses. Hand-derived gradients FD-checked per parameter
+  embedding and one trainable weight matrix, in frozen-E and learnable-E
+  regimes over the same degree-normalized cross-entropy Tier 1 uses. Hand-derived gradients FD-checked per parameter
   block, a GELU variant, per-step CSV instrumentation, cosine and adjacency
   heatmaps, and `examples/tier2_tinynn.rs`. New `numerics` and `output`
   modules hold the softmax, log-sum-exp, cross-entropy, seeded Gaussian draw
@@ -20,27 +19,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Findings (Tier 2)
 
-- **Refutation 3c reproduces.** The frozen regime reaches its maximum
-  top-d(u) neighbour score at **step 1** on all four graphs and both seeds,
-  inside the paper's two steps, while a geometry needs 554–743 steps at
-  η = 0.001 — a ratio of 743 on the 15-cycle. The same asymmetry holds
-  inside a single learnable run (memorization at step 15–29, geometry at
-  605–743, a ratio of 49.5 on the cycle).
+> **Retraction, 2026-08-29.** An adversarial review of the shell-based
+> geometry criterion found it unsound, and every claim below that used the
+> word "geometry" is withdrawn pending the replacement measure. What the
+> criterion actually scores is the deepest read shell's mean cosine, and it
+> reads only shells 2 and 3. Measured: a cosine matrix with neighbours
+> near-antipodal (d1 = −0.9, d2 = +0.6, d3 = +0.2) scores 0.200 and passes on
+> all four graphs; a near-collapsed cone (d1 = d2 = 0.95, d3 = 0.80) scores
+> 0.150 and passes. Raising the read depth to four shells makes the same runs
+> fail (path-star peaks at −0.000439 over 1200 steps). Worse, the certified
+> embeddings load on the **bottom** of the spectrum — top singular direction
+> at eigenvector index 16/15/14 of −L with Fiedler-mass **0.00**, against
+> Node2Vec's 0.98–1.00 on the same graphs — so the quantity measured is not
+> the spectral geometry §4.1 describes. The 0.05 threshold also rejects the
+> paper's own reference geometry on the path-star (0.0313) while accepting a
+> rank-1 embedding on the grid and cycle.
+
+- **Refutation 3c's associative half reproduces.** The frozen regime reaches
+  its maximum top-d(u) neighbour score at **step 1** on all four graphs and
+  both seeds, inside the paper's two steps. Initial scores 0.089–0.221 and
+  0.078–0.167; correlation between the model's distribution and D⁻¹A is
+  0.974–0.981 at the hit step. The timing *ratio* against the geometric side
+  is withdrawn with the criterion, and the pin that carried it mixed regimes
+  and rates: at matched η within one learnable run the largest ratio measured
+  is **49.5** (cycle, η = 0.001), below the 50 it asserted, and 13.6 at
+  seed 42.
 - **The ≤2-step result depends on an initializer the paper does not state.**
-  At `weight_sigma = 1/√m` it takes 5–10 steps; at `embedding_sigma = 1.0` it
-  does not arrive within 20. The committed default (E ~ N(0,1/m),
-  W ~ N(0,1/m²)) is the near-orthogonal-embedding setting the one-step
-  argument is derived at, and is a documented guess.
-- **Figure 22's "η = 0.1 is too aggressive to create the geometry" did not
-  reproduce.** At η = 0.1 the criterion is met earliest (7–9 steps) with an
-  equal-or-larger peak margin than the smaller rates reach.
+  Measured across a σ grid: at `weight_sigma = 1/√m` it takes 4–10 steps
+  (seed-dependent); at the PyTorch `nn.Linear` default it fails on three of
+  four graphs; at `embedding_sigma = 1.0` it never arrives within 200 steps.
+  It is also width-dependent — never within 500 steps at m = 8, and 1–2 steps
+  only from m ≈ 128. The committed default (E ~ N(0,1/√m), W ~ N(0,1/m)) sits
+  where ‖EEᵀ − I‖_max = 0.156, the near-orthogonality the one-step argument
+  assumes, and is a documented guess.
+- **Figure 22's "η = 0.1 is too aggressive" did not reproduce, and cannot
+  under the captions' optimizer.** The three swept rates trace one
+  gradient-flow trajectory — max|E(η=0.1, 10 steps) − E(η=0.01, 100 steps)|
+  is 1.3e-2 against max|E| ≈ 2.4e-1, and the step count scales as 1/η — so
+  under the constant-rate full-batch GD Figures 7/8/22 describe, no learning
+  rate can be "too aggressive to create" what a smaller one creates later.
+  §B.3 instead specifies AdamW with weight decay and a cosine schedule; the
+  implementation follows the captions. The η = 0.1 embedding is not
+  degenerate (numeric rank = n, effective rank 9.9–12.3, row-norm spread
+  ≤ 1.34). This finding survives the retraction because it rests on the
+  trajectory, not on the criterion.
 - **Figure 23's "gradual decrease in similarity" does not hold for this
-  architecture.** The learned shell profile is non-monotone on all four
-  graphs — distance-2 pairs carry the highest mean cosine (cycle at η = 0.01:
-  −0.102 / +0.389 / −0.198) — which is why the geometry criterion measures
-  the deepest shell's distance from zero rather than monotone decay.
-- The geometry criterion is this POC's own definition; the paper states none.
-  An adjacency-row embedding scores exactly zero on it.
+  architecture, and the deviation is larger than first reported.** Over the
+  full diameter the distance-2 mean is the global maximum on every graph
+  (cycle η = 0.001: −0.169, **+0.379**, −0.098, −0.088, −0.083, −0.184,
+  −0.136), not a decay. Node2Vec on the same graphs is monotone throughout
+  (cycle +0.962 → +0.121 across d1..d7), which is the contrast the paper
+  draws.
+- **A diverged run could report a geometry.** At η = 10 the irregular graph
+  scored 0.098 at loss 9.99e27, cosines being scale-invariant; once the
+  embedding is wholly non-finite the score is 0.0000 rather than NaN. No
+  reported number is affected (all swept rates stay finite, final losses
+  10.18–20.57), but the measure needs a finiteness guard.
 
 ### Added
 
