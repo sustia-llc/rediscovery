@@ -168,7 +168,6 @@ async fn main() -> Result<()> {
             pool.install(|| {
                 jobs.par_iter()
                     .try_for_each(|&(stem, graph, learning_rate)| {
-                        let token = token.clone();
                         if token.is_cancelled() {
                             tracing::warn!(
                                 graph = stem,

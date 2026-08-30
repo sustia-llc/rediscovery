@@ -1295,8 +1295,9 @@ mod tests {
 
     /// Bound on the entrywise deviation between an analytic gradient and its
     /// central difference at the production width. The measured maximum over
-    /// the 1024 sampled entries — the four D-graphs, both blocks and both
-    /// activations — is 2.147e-9, so this leaves an order of magnitude over f64
+    /// the 1024 comparisons — the four D-graphs, both blocks and both
+    /// activations, with same-shaped blocks sampling the same seeded
+    /// positions — is 2.147e-9, so this leaves an order of magnitude over f64
     /// rounding at `FD_STEP`.
     const SAMPLED_FD_TOLERANCE: f64 = 1e-7;
 
@@ -1308,9 +1309,9 @@ mod tests {
     /// Both gradient blocks agree with central differences at a seeded sample
     /// of their entries, at [`Params::default`]'s width m = 512 and its draw
     /// scales, on every D-graph and both activations. `FD_SETTINGS` probes
-    /// m = 8 and 16 densely; this probes the width every run of the crate uses,
-    /// where nalgebra's matrix product takes its packed path. The measured
-    /// maximum deviation and the sampled gradient magnitudes are printed.
+    /// m = 8 and 16 densely; this probes the width every run of the crate
+    /// uses. The measured maximum deviation and the sampled gradient
+    /// magnitudes are printed.
     #[test]
     fn gradients_match_sampled_central_differences_at_the_production_width() {
         let mut worst = 0.0_f64;
@@ -2272,7 +2273,9 @@ mod tests {
     ///
     /// The 12 configurations run on a [`sweep_pool`], each run internally
     /// sequential and drawing from its own seeded stream. Each returns its
-    /// measurement lines, printed in configuration order once the pool is done.
+    /// measurement lines, printed in configuration order once the pool is
+    /// done; a panicking configuration is re-raised after the surviving lines
+    /// print.
     #[test]
     fn the_learnable_run_misses_the_geometry_and_peaks_at_distance_two() {
         let graphs = d_graphs();
@@ -2285,17 +2288,40 @@ mod tests {
             })
             .collect();
 
-        let reports: Vec<Vec<String>> = sweep_pool().install(|| {
+        let reports: Vec<std::thread::Result<Vec<String>>> = sweep_pool().install(|| {
             configurations
                 .par_iter()
                 .map(|&(name, graph, learning_rate, budget)| {
-                    learnable_sweep_reports(name, graph, learning_rate, budget)
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        learnable_sweep_reports(name, graph, learning_rate, budget)
+                    }))
                 })
                 .collect()
         });
 
-        for report in reports.iter().flatten() {
-            println!("{report}");
+        print_surviving_reports_then_reraise(reports);
+    }
+
+    /// Prints every non-panicked configuration's measurement lines in
+    /// configuration order, then re-raises the first panic if one occurred.
+    fn print_surviving_reports_then_reraise(reports: Vec<std::thread::Result<Vec<String>>>) {
+        let mut first_failure = None;
+        for outcome in reports {
+            match outcome {
+                Ok(lines) => {
+                    for line in lines {
+                        println!("{line}");
+                    }
+                }
+                Err(panic) => {
+                    if first_failure.is_none() {
+                        first_failure = Some(panic);
+                    }
+                }
+            }
+        }
+        if let Some(panic) = first_failure {
+            std::panic::resume_unwind(panic);
         }
     }
 
@@ -2416,19 +2442,22 @@ mod tests {
     ///
     /// The four graphs run on a [`sweep_pool`], each graph's pair of seeded
     /// runs internally sequential. Each returns its measurement lines, printed
-    /// in graph order once the pool is done.
+    /// in graph order once the pool is done; a panicking graph is re-raised
+    /// after the surviving lines print.
     #[test]
     fn the_frozen_run_memorizes_without_moving_its_embedding() {
-        let reports: Vec<Vec<String>> = sweep_pool().install(|| {
+        let reports: Vec<std::thread::Result<Vec<String>>> = sweep_pool().install(|| {
             d_graphs()
                 .into_par_iter()
-                .map(|(name, graph)| frozen_sweep_reports(name, &graph))
+                .map(|(name, graph)| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        frozen_sweep_reports(name, &graph)
+                    }))
+                })
                 .collect()
         });
 
-        for report in reports.iter().flatten() {
-            println!("{report}");
-        }
+        print_surviving_reports_then_reraise(reports);
     }
 
     /// One graph of [`the_frozen_run_memorizes_without_moving_its_embedding`]:

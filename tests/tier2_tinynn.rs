@@ -294,7 +294,8 @@ fn the_same_seed_reproduces_a_trajectory_bit_for_bit() {
 ///
 /// The 24 configurations run on a [`SWEEP_THREADS`]-worker rayon pool, each run
 /// internally sequential and drawing from its own seeded stream. Each returns
-/// its measurement line, printed in configuration order once the pool is done.
+/// its measurement line, printed in configuration order once the pool is done;
+/// a panicking configuration is re-raised after the surviving lines print.
 #[test]
 fn the_associative_fit_completes_while_the_geometry_never_forms() {
     let graphs = d_graphs();
@@ -313,70 +314,83 @@ fn the_associative_fit_completes_while_the_geometry_never_forms() {
         .num_threads(SWEEP_THREADS)
         .build()
         .expect("a rayon pool of SWEEP_THREADS workers");
-    let reports: Vec<String> = pool.install(|| {
+    let reports: Vec<std::thread::Result<String>> = pool.install(|| {
         configurations
             .par_iter()
             .map(|&(seed, name, graph, learning_rate, budget)| {
-                let params = Params {
-                    learning_rate,
-                    max_steps: budget,
-                    regime: Regime::LearnableEmbedding,
-                    ..Params::default()
-                };
-                let paths = RunPaths::new("timing");
-                let started = Instant::now();
-                let run = run_into(graph, &params, seed, &paths);
-                let label = format!("{name} at eta = {learning_rate}, seed {seed}");
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let params = Params {
+                        learning_rate,
+                        max_steps: budget,
+                        regime: Regime::LearnableEmbedding,
+                        ..Params::default()
+                    };
+                    let paths = RunPaths::new("timing");
+                    let started = Instant::now();
+                    let run = run_into(graph, &params, seed, &paths);
+                    let label = format!("{name} at eta = {learning_rate}, seed {seed}");
 
-                let associative_step = run.associative_step().unwrap_or_else(|| {
-                    panic!(
-                        "{label}: the top-d score never reached 1 in {budget} steps; it peaked \
+                    let associative_step = run.associative_step().unwrap_or_else(|| {
+                        panic!(
+                            "{label}: the top-d score never reached 1 in {budget} steps; it peaked \
                          at {:.6}",
-                        run.peak_associative_score()
-                    )
-                });
-                assert!(
-                    associative_step >= 1,
-                    "{label}: the top-d score was already at its maximum before the first \
+                            run.peak_associative_score()
+                        )
+                    });
+                    assert!(
+                        associative_step >= 1,
+                        "{label}: the top-d score was already at its maximum before the first \
                      update, so the ratio below would measure nothing"
-                );
+                    );
 
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "step counts here are below 2^53 and exact in f64"
-                )]
-                let ratio = budget as f64 / associative_step as f64;
-                let report = format!(
-                    "{label}: {:?}, memorization at step {associative_step}, budget {budget} \
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "step counts here are below 2^53 and exact in f64"
+                    )]
+                    let ratio = budget as f64 / associative_step as f64;
+                    let report = format!(
+                        "{label}: {:?}, memorization at step {associative_step}, budget {budget} \
                      (ratio {ratio:.1}), alignment step {:?} (peak {:.6}, initial {:.6}), \
                      peak shell separation {:.6}",
-                    started.elapsed(),
-                    run.alignment_step(FIEDLER_ALIGNMENT),
-                    run.peak_alignment(),
-                    run.records()[0].fiedler_alignment(),
-                    run.peak_deepest_shell_separation()
-                );
+                        started.elapsed(),
+                        run.alignment_step(FIEDLER_ALIGNMENT),
+                        run.peak_alignment(),
+                        run.records()[0].fiedler_alignment(),
+                        run.peak_deepest_shell_separation()
+                    );
 
-                let peak = run.peak_alignment();
-                assert!(
-                    peak < FIEDLER_ALIGNMENT,
-                    "{label}: the Fiedler alignment peaked at {peak:.6} over {budget} steps, \
+                    let peak = run.peak_alignment();
+                    assert!(
+                        peak < FIEDLER_ALIGNMENT,
+                        "{label}: the Fiedler alignment peaked at {peak:.6} over {budget} steps, \
                      reaching the {FIEDLER_ALIGNMENT} criterion at step {:?}",
-                    run.alignment_step(FIEDLER_ALIGNMENT)
-                );
-                assert!(
-                    ratio >= TIMING_FLOOR,
-                    "{label}: the budget {budget} is only {ratio:.1} times the memorization \
+                        run.alignment_step(FIEDLER_ALIGNMENT)
+                    );
+                    assert!(
+                        ratio >= TIMING_FLOOR,
+                        "{label}: the budget {budget} is only {ratio:.1} times the memorization \
                      step {associative_step}, below the pinned {TIMING_FLOOR}, so the null \
                      above bounds the geometry step by less than that factor"
-                );
-                report
+                    );
+                    report
+                }))
             })
             .collect()
     });
 
-    for report in reports {
-        println!("{report}");
+    let mut first_failure = None;
+    for outcome in reports {
+        match outcome {
+            Ok(line) => println!("{line}"),
+            Err(panic) => {
+                if first_failure.is_none() {
+                    first_failure = Some(panic);
+                }
+            }
+        }
+    }
+    if let Some(panic) = first_failure {
+        std::panic::resume_unwind(panic);
     }
 }
 
