@@ -15,7 +15,9 @@ use rayon::prelude::*;
 use rediscovery::graph::Graph;
 use rediscovery::node2vec::Outcome;
 use rediscovery::subsystems::runner::Runner;
-use rediscovery::tinynn::{self, FIEDLER_ALIGNMENT, Outputs, Params, Regime, Run, TinyNn};
+use rediscovery::tinynn::{
+    self, FIEDLER_ALIGNMENT, Outputs, Params, Regime, Run, StopReason, TinyNn,
+};
 
 /// Upper bound on awaits a cancellation regression could hang; the passing
 /// paths resolve well inside it.
@@ -444,6 +446,13 @@ async fn a_cancelled_run_stops_and_leaves_a_well_formed_csv() {
         "outcome is {:?} after {} steps, expected Stopped",
         run.outcome(),
         run.steps()
+    );
+    assert_eq!(
+        run.stop_reason(),
+        StopReason::Stopped,
+        "the cancelled run's stop reason is {:?}, so a geometry stop would be \
+         indistinguishable from the cancellation",
+        run.stop_reason()
     );
     assert_eq!(
         run.steps(),

@@ -16,6 +16,13 @@
 //! [`TinyNn::deepest_shell_separation`], which reads the deepest shell of the
 //! distance-shell cosine profile of Fig. 23. [`run`] takes an explicit output
 //! path and seed (decision D8, `docs/2510.26745v2-poc-analysis.md` §8).
+//!
+//! Four [`Params`] knobs move a run between the Node2Vec-equivalent corner and
+//! the committed regime: [`WeightInit`] picks W's initialization,
+//! [`Params::weight_rate_ratio`] scales W's rate against E's,
+//! [`Optimizer`] picks constant-rate descent or the decoupled AdamW of §B.3
+//! under [`scheduled_rate`], and [`Params::alignment_stop`] ends a run at the
+//! first step whose Fiedler alignment reaches a threshold.
 
 #![allow(
     clippy::doc_markdown,
@@ -125,11 +132,68 @@ pub enum Regime {
     LearnableEmbedding,
 }
 
+/// How [`TinyNn::initial_parameters`] builds W.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightInit {
+    /// W is drawn from N(0, [`Params::weight_sigma`]²) over the stream keyed
+    /// by [`second_factor_seed`] of the run seed.
+    Gaussian,
+    /// W is the m×m identity, the setting under which a linear hidden layer
+    /// makes the logits Tier 1's V Vᵀ and −∂L/∂E Lemma 6's ascent direction
+    /// (`the_identity_weight_reproduces_the_tier1_ascent_direction`).
+    Identity,
+}
+
+/// The decoupled-AdamW knobs of §B.3.
+///
+/// The paper states the weight decay 0.01 and a cosine schedule with warm-up;
+/// [`AdamW::default`] carries that decay together with PyTorch's β₁ = 0.9,
+/// β₂ = 0.999 and ε = 1e-8, which §B.3 does not state, and a warm-up over the
+/// first 5 % of the step budget, whose length §B.3 does not state either.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AdamW {
+    /// First-moment decay β₁.
+    pub beta1: f64,
+    /// Second-moment decay β₂.
+    pub beta2: f64,
+    /// Denominator floor ε.
+    pub epsilon: f64,
+    /// Decoupled weight decay, applied to the stepped parameter rather than
+    /// through the gradient.
+    pub weight_decay: f64,
+    /// Fraction of [`Params::max_steps`] the linear warm-up spans.
+    pub warmup_fraction: f64,
+}
+
+impl Default for AdamW {
+    fn default() -> Self {
+        Self {
+            beta1: 0.9,
+            beta2: 0.999,
+            epsilon: 1e-8,
+            weight_decay: 0.01,
+            warmup_fraction: 0.05,
+        }
+    }
+}
+
+/// How a run turns a gradient into the movement it subtracts from a block.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Optimizer {
+    /// p ← p − η g at the constant η of [`Params::learning_rate`], the reading
+    /// the captions of Figs. 7, 8 and 22 state.
+    GradientDescent,
+    /// Decoupled AdamW at the rate [`scheduled_rate`] gives, the reading §B.3
+    /// states.
+    AdamW(AdamW),
+}
+
 /// Run parameters for gradient descent on the TinyNN cross-entropy.
 ///
 /// [`Params::default`] carries decision D10's associative setting: the
 /// §B.2.2 width m = 512, η = 0.1, a frozen embedding, and a linear hidden
-/// layer.
+/// layer, with the Gaussian W draw, a weight rate equal to the embedding's,
+/// constant-rate descent, and no geometry stop.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Params {
     /// Hidden width m, the column count of E and the order of W.
@@ -149,6 +213,19 @@ pub struct Params {
     pub activation: Activation,
     /// Which parameter blocks the descent updates.
     pub regime: Regime,
+    /// How [`TinyNn::initial_parameters`] builds W.
+    pub weight_init: WeightInit,
+    /// The relative rate ρ = η_W/η_E: E moves at the run's rate and W at ρ
+    /// times it, so ρ = 0 holds W at its initialization for the whole run.
+    pub weight_rate_ratio: f64,
+    /// How a gradient becomes the movement subtracted from a block.
+    pub optimizer: Optimizer,
+    /// Fiedler alignment at or above which [`run`] ends with
+    /// [`StopReason::Aligned`], checked on each recorded step before the
+    /// convergence and budget checks. `None` leaves the other stopping rules
+    /// — convergence, the step budget, and the caller's `should_stop` — to
+    /// end the run.
+    pub alignment_stop: Option<f64>,
 }
 
 impl Params {
@@ -171,19 +248,29 @@ impl Params {
             tolerance: 1e-10,
             activation: Activation::Linear,
             regime: Regime::FrozenEmbedding,
+            weight_init: WeightInit::Gaussian,
+            weight_rate_ratio: 1.0,
+            optimizer: Optimizer::GradientDescent,
+            alignment_stop: None,
         }
     }
 
-    /// Rejects a zero width or step budget and a non-positive or non-finite
-    /// σ, η, or tolerance.
+    /// Rejects a zero width or step budget, a non-positive or non-finite σ, η,
+    /// or tolerance, a negative or non-finite weight rate ratio, and
+    /// out-of-range AdamW knobs.
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidDimension`] for `width == 0`,
-    /// [`Error::ZeroMaxSteps`] for `max_steps == 0`, and
+    /// [`Error::ZeroMaxSteps`] for `max_steps == 0`,
     /// [`Error::InvalidRunParameter`] naming the first of `embedding_sigma`,
-    /// `weight_sigma`, `learning_rate`, `tolerance` that is not positive and
-    /// finite.
+    /// `weight_sigma`, `learning_rate`, `tolerance`, `epsilon` that is not
+    /// positive and finite, [`Error::NegativeRunParameter`] naming the first
+    /// of `weight_rate_ratio`, `weight_decay` that is not non-negative and
+    /// finite, and [`Error::RunParameterNotAFraction`] naming the first of
+    /// `beta1`, `beta2`, `warmup_fraction` outside [0, 1) — or a
+    /// `Some` `alignment_stop` outside [0, 1], the range
+    /// [`TinyNn::fiedler_alignment`] takes values in.
     pub fn validate(&self) -> Result<()> {
         if self.width == 0 {
             return Err(Error::InvalidDimension {
@@ -193,15 +280,48 @@ impl Params {
         if self.max_steps == 0 {
             return Err(Error::ZeroMaxSteps);
         }
-        for (parameter, value) in [
+        let mut positive = vec![
             ("embedding_sigma", self.embedding_sigma),
             ("weight_sigma", self.weight_sigma),
             ("learning_rate", self.learning_rate),
             ("tolerance", self.tolerance),
-        ] {
+        ];
+        let mut non_negative = vec![("weight_rate_ratio", self.weight_rate_ratio)];
+        let mut fractions = Vec::new();
+        if let Optimizer::AdamW(settings) = self.optimizer {
+            positive.push(("epsilon", settings.epsilon));
+            non_negative.push(("weight_decay", settings.weight_decay));
+            fractions.extend([
+                ("beta1", settings.beta1),
+                ("beta2", settings.beta2),
+                ("warmup_fraction", settings.warmup_fraction),
+            ]);
+        }
+
+        for (parameter, value) in positive {
             if !(value.is_finite() && value > 0.0) {
                 return Err(Error::InvalidRunParameter { parameter, value });
             }
+        }
+        for (parameter, value) in non_negative {
+            if !(value.is_finite() && value >= 0.0) {
+                return Err(Error::NegativeRunParameter { parameter, value });
+            }
+        }
+        for (parameter, value) in fractions {
+            // A NaN or infinite value is outside the range, so this covers the
+            // non-finite cases the two loops above test for explicitly.
+            if !(0.0..1.0).contains(&value) {
+                return Err(Error::RunParameterNotAFraction { parameter, value });
+            }
+        }
+        if let Some(value) = self.alignment_stop
+            && !(0.0..=1.0).contains(&value)
+        {
+            return Err(Error::RunParameterNotAFraction {
+                parameter: "alignment_stop",
+                value,
+            });
         }
         Ok(())
     }
@@ -396,8 +516,10 @@ impl TinyNn {
             .map_or(&[], Vec::as_slice)
     }
 
-    /// Draws E from `seed` and W from [`second_factor_seed`] of it, both with
-    /// `params`-scaled standard normals.
+    /// Draws E from `seed` with `params`-scaled standard normals and builds W
+    /// as [`Params::weight_init`] asks: the same draw from
+    /// [`second_factor_seed`] of `seed` under [`WeightInit::Gaussian`], the
+    /// identity under [`WeightInit::Identity`].
     ///
     /// # Errors
     ///
@@ -406,12 +528,15 @@ impl TinyNn {
     pub fn initial_parameters(&self, params: &Params, seed: u64) -> Result<Parameters> {
         params.validate()?;
         let embedding = gaussian_matrix(self.order, params.width, params.embedding_sigma, seed)?;
-        let weight = gaussian_matrix(
-            params.width,
-            params.width,
-            params.weight_sigma,
-            second_factor_seed(seed),
-        )?;
+        let weight = match params.weight_init {
+            WeightInit::Gaussian => gaussian_matrix(
+                params.width,
+                params.width,
+                params.weight_sigma,
+                second_factor_seed(seed),
+            )?,
+            WeightInit::Identity => DMatrix::identity(params.width, params.width),
+        };
         Parameters::new(embedding, weight)
     }
 
@@ -778,6 +903,204 @@ fn fiedler_like_set(spectrum: &Spectrum, components: usize) -> Range<usize> {
     start..end
 }
 
+/// The number of warm-up steps `fraction` of `budget` gives: the rounded
+/// product, held to at least one step and at most the budget.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the float-to-usize cast saturates on any fraction, finite or not, and the clamp below bounds the result to [1, max(budget, 1)]"
+)]
+fn warmup_steps(budget: usize, fraction: f64) -> usize {
+    let raw = (budget as f64 * fraction).round() as usize;
+    raw.clamp(1, budget.max(1))
+}
+
+/// The §B.3 rate at `step` of a `budget`-step run: a linear warm-up from 0 to
+/// `peak` over the first `fraction` of the budget, then a cosine decay from
+/// `peak` to 0 over the remainder.
+///
+/// It is 0 at step 0 and `peak` at the warm-up count, the first cosine step.
+/// When the cosine phase is non-empty it is half `peak` halfway through that
+/// phase, 0 at `budget` — the endpoint the run approaches, one past its last
+/// applied update — and 0 at every step beyond. When the warm-up consumes the
+/// whole budget the cosine phase is empty and every step at or past the
+/// warm-up count returns `peak`.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "step counts and budgets here are far below 2^53 and exact in f64"
+)]
+pub fn scheduled_rate(step: usize, budget: usize, peak: f64, fraction: f64) -> f64 {
+    let warmup = warmup_steps(budget, fraction);
+    if step < warmup {
+        return peak * (step as f64) / (warmup as f64);
+    }
+    let remaining = budget.saturating_sub(warmup);
+    if remaining == 0 {
+        return peak;
+    }
+    let progress = (((step - warmup) as f64) / (remaining as f64)).min(1.0);
+    peak * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos())
+}
+
+/// One block's decoupled-AdamW moment state.
+#[derive(Debug, Clone)]
+struct Moments {
+    first: DMatrix<f64>,
+    second: DMatrix<f64>,
+    updates: i32,
+}
+
+impl Moments {
+    /// Zero moments shaped like the block they track.
+    fn zeros(rows: usize, columns: usize) -> Self {
+        Self {
+            first: DMatrix::zeros(rows, columns),
+            second: DMatrix::zeros(rows, columns),
+            updates: 0,
+        }
+    }
+
+    /// Advances the moments by `gradient` and returns the movement to subtract
+    /// from `parameter`: the bias-corrected step η m̂/(√v̂ + ε) followed by the
+    /// decoupled decay of the stepped value by 1 − η·wd, as one difference.
+    ///
+    /// The decay reaches the parameter without passing through `gradient`, so
+    /// the moments track the loss gradient alone.
+    fn advance(
+        &mut self,
+        parameter: &DMatrix<f64>,
+        gradient: &DMatrix<f64>,
+        rate: f64,
+        settings: AdamW,
+    ) -> DMatrix<f64> {
+        self.updates = self.updates.saturating_add(1);
+        self.first *= settings.beta1;
+        self.first += gradient * (1.0 - settings.beta1);
+        self.second *= settings.beta2;
+        self.second += gradient.map(|entry| entry * entry) * (1.0 - settings.beta2);
+
+        let first_correction = 1.0 - settings.beta1.powi(self.updates);
+        let second_correction = 1.0 - settings.beta2.powi(self.updates);
+        let step = DMatrix::from_fn(parameter.nrows(), parameter.ncols(), |i, j| {
+            let first = self.first[(i, j)] / first_correction;
+            let second = self.second[(i, j)] / second_correction;
+            rate * first / (second.sqrt() + settings.epsilon)
+        });
+
+        let decayed = (parameter - step) * (1.0 - rate * settings.weight_decay);
+        parameter - decayed
+    }
+}
+
+/// The movement one step subtracts from each block a run trains, the embedding
+/// term being absent under [`Regime::FrozenEmbedding`].
+struct Deltas {
+    weight: DMatrix<f64>,
+    embedding: Option<DMatrix<f64>>,
+}
+
+/// The optimizer state a run carries between steps.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one `Updater` lives on the stack per run; the 216 bytes are four matrix headers and the knobs, the moment entries themselves already being behind the matrices' own allocations"
+)]
+enum Updater {
+    /// Constant-rate descent, which carries none.
+    Descent,
+    /// Decoupled AdamW, which carries one moment pair per block.
+    Adam {
+        settings: AdamW,
+        weight: Moments,
+        embedding: Moments,
+    },
+}
+
+impl Updater {
+    /// The state [`Params::optimizer`] asks for, shaped for `parameters`.
+    fn new(params: &Params, parameters: &Parameters) -> Self {
+        match params.optimizer {
+            Optimizer::GradientDescent => Self::Descent,
+            Optimizer::AdamW(settings) => Self::Adam {
+                settings,
+                weight: Moments::zeros(parameters.width(), parameters.width()),
+                embedding: Moments::zeros(
+                    parameters.embedding.nrows(),
+                    parameters.embedding.ncols(),
+                ),
+            },
+        }
+    }
+
+    /// The movement `step` subtracts from each trained block, beside the rate
+    /// the embedding block moved at.
+    ///
+    /// W moves at [`Params::weight_rate_ratio`] times that rate, so a ratio of
+    /// 0 leaves W where it was under either optimizer. The AdamW arm advances
+    /// its moments here; a run that ends without applying the returned movement
+    /// discards them with the rest of the state.
+    fn propose(
+        &mut self,
+        parameters: &Parameters,
+        gradients: &Gradients,
+        params: &Params,
+        step: usize,
+    ) -> (Deltas, f64) {
+        match self {
+            Self::Descent => {
+                let rate = params.learning_rate;
+                let deltas = Deltas {
+                    weight: gradients.weight() * (rate * params.weight_rate_ratio),
+                    embedding: gradients.embedding().map(|gradient| gradient * rate),
+                };
+                (deltas, rate)
+            }
+            Self::Adam {
+                settings,
+                weight,
+                embedding,
+            } => {
+                let settings = *settings;
+                let rate = scheduled_rate(
+                    step,
+                    params.max_steps,
+                    params.learning_rate,
+                    settings.warmup_fraction,
+                );
+                let deltas = Deltas {
+                    weight: weight.advance(
+                        &parameters.weight,
+                        gradients.weight(),
+                        rate * params.weight_rate_ratio,
+                        settings,
+                    ),
+                    embedding: gradients.embedding().map(|gradient| {
+                        embedding.advance(&parameters.embedding, gradient, rate, settings)
+                    }),
+                };
+                (deltas, rate)
+            }
+        }
+    }
+}
+
+/// Why a [`run`] step loop ended, separating the geometry stop of
+/// [`Params::alignment_stop`] from the `should_stop` one that
+/// [`Run::outcome`] merges it with under [`Outcome::Stopped`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// The relative update fell to or below [`Params::tolerance`] at a step
+    /// whose rate was above zero.
+    Converged,
+    /// [`Params::max_steps`] updates were applied.
+    StepLimit,
+    /// A recorded step's Fiedler alignment reached [`Params::alignment_stop`].
+    Aligned,
+    /// The `should_stop` predicate returned `true`.
+    Stopped,
+}
+
 /// One recorded step: the state after `step` applied updates, together with
 /// the relative size of the update pending from it.
 #[derive(Debug, Clone, PartialEq)]
@@ -841,7 +1164,7 @@ impl StepRecord {
 pub struct Run {
     parameters: Parameters,
     records: Vec<StepRecord>,
-    outcome: Outcome,
+    stop: StopReason,
     steps: usize,
 }
 
@@ -870,10 +1193,24 @@ impl Run {
         self.steps
     }
 
-    /// Why the step loop ended.
+    /// Why the step loop ended, reading [`StopReason::Aligned`] as
+    /// [`Outcome::Stopped`] — both end the loop early through a stop signal
+    /// rather than through the budget or the tolerance;
+    /// [`Run::stop_reason`] separates the two.
     #[must_use]
     pub fn outcome(&self) -> Outcome {
-        self.outcome
+        match self.stop {
+            StopReason::Converged => Outcome::Converged,
+            StopReason::StepLimit => Outcome::StepLimit,
+            StopReason::Aligned | StopReason::Stopped => Outcome::Stopped,
+        }
+    }
+
+    /// Why the step loop ended, with the geometry stop named separately from
+    /// the `should_stop` one.
+    #[must_use]
+    pub fn stop_reason(&self) -> StopReason {
+        self.stop
     }
 
     /// The first step whose associative score is within
@@ -932,16 +1269,18 @@ pub struct Outputs<'a> {
     pub cosines: &'a Path,
 }
 
-/// Runs full-batch gradient descent on `graph`, streaming one CSV row per
-/// recorded step to `outputs.history` and writing the final node-node
-/// cosine-similarity matrix to `outputs.cosines`.
+/// Runs full-batch training on `graph`, streaming one CSV row per recorded
+/// step to `outputs.history` and writing the final node-node cosine-similarity
+/// matrix to `outputs.cosines`.
 ///
-/// Each step subtracts η times the gradient from every block
-/// [`Params::regime`] trains, both updates read off the same pre-update
-/// parameters, polling `should_stop` once per applied update. It stops on
-/// convergence (relative update ≤ [`Params::tolerance`]), on reaching
-/// [`Params::max_steps`], or on `should_stop` returning `true`; the CSV holds
-/// a header row followed by one complete row per recorded step in each case.
+/// Each step subtracts the movement [`Params::optimizer`] proposes from every
+/// block [`Params::regime`] trains, every block reading off the same
+/// pre-update parameters, polling `should_stop` once per applied update. It
+/// stops on the geometry criterion of [`Params::alignment_stop`], on
+/// convergence (relative update ≤ [`Params::tolerance`] at a step whose rate
+/// is above zero), on reaching [`Params::max_steps`], or on `should_stop`
+/// returning `true`, checked in that order; the CSV holds a header row
+/// followed by one complete row per recorded step in each case.
 ///
 /// # Errors
 ///
@@ -958,22 +1297,20 @@ pub fn run<S: Fn() -> bool>(
     params.validate()?;
     let system = TinyNn::new(graph)?;
     let mut parameters = system.initial_parameters(params, seed)?;
+    let mut updater = Updater::new(params, &parameters);
 
     let mut sink = BufWriter::new(File::create(outputs.history)?);
     write_header(&mut sink, system.shell_count())?;
 
     let mut records = Vec::new();
     let mut steps = 0_usize;
-    let outcome = loop {
+    let stop = loop {
         let forward = system.forward(&parameters, params.activation)?;
         let gradients =
             system.gradients_of(&parameters, params.activation, params.regime, &forward);
-        let weight_update = gradients.weight() * params.learning_rate;
-        let embedding_update = gradients
-            .embedding()
-            .map(|gradient| gradient * params.learning_rate);
+        let (deltas, rate) = updater.propose(&parameters, &gradients, params, steps);
 
-        let moved = weight_update.norm() + embedding_update.as_ref().map_or(0.0, DMatrix::norm);
+        let moved = deltas.weight.norm() + deltas.embedding.as_ref().map_or(0.0, DMatrix::norm);
         let relative_update = moved / (parameters.weight.norm() + parameters.embedding.norm());
         let shell_means = system.shell_means(&parameters.embedding);
 
@@ -986,23 +1323,31 @@ pub fn run<S: Fn() -> bool>(
             relative_update,
             shell_means,
         };
+        let aligned = params
+            .alignment_stop
+            .is_some_and(|threshold| record.fiedler_alignment >= threshold);
         write_row(&mut sink, &record)?;
         records.push(record);
 
-        if relative_update <= params.tolerance {
-            break Outcome::Converged;
+        if aligned {
+            break StopReason::Aligned;
+        }
+        // A step the schedule gave a zero rate moves nothing, which is the
+        // warm-up doing its job rather than the descent having converged.
+        if rate > 0.0 && relative_update <= params.tolerance {
+            break StopReason::Converged;
         }
         if steps >= params.max_steps {
-            break Outcome::StepLimit;
+            break StopReason::StepLimit;
         }
         // Polled before the update so that on every outcome the returned
         // state is the one the last record and CSV row describe.
         if should_stop() {
-            break Outcome::Stopped;
+            break StopReason::Stopped;
         }
 
-        parameters.weight -= &weight_update;
-        if let Some(update) = &embedding_update {
+        parameters.weight -= &deltas.weight;
+        if let Some(update) = &deltas.embedding {
             parameters.embedding -= update;
         }
         steps += 1;
@@ -1014,7 +1359,7 @@ pub fn run<S: Fn() -> bool>(
     Ok(Run {
         parameters,
         records,
-        outcome,
+        stop,
         steps,
     })
 }
@@ -2590,6 +2935,1145 @@ mod tests {
             "cycle(15) gelu: the learnable run's top-d score peaked at {:.6}, so the alignment \
              null above is a run that learned nothing",
             geometric.peak_associative_score()
+        );
+    }
+
+    // The transition machinery of issue #5: the W initializer, the relative
+    // weight rate ρ, the §B.3 optimizer, and the geometry stop. These pin the
+    // machinery; no threshold here asserts an experiment outcome.
+
+    /// One decoupled AdamW update by hand from the §B.3 formulas, on one
+    /// scalar: the decayed moments, their bias correction at update `updates`,
+    /// the adaptive step, then the decay of the stepped value. Returns the new
+    /// parameter beside the new moments.
+    fn adamw_reference_step(
+        parameter: f64,
+        first: f64,
+        second: f64,
+        gradient: f64,
+        rate: f64,
+        updates: i32,
+        settings: AdamW,
+    ) -> (f64, f64, f64) {
+        let first = settings.beta1 * first + (1.0 - settings.beta1) * gradient;
+        let second = settings.beta2 * second + (1.0 - settings.beta2) * gradient * gradient;
+        let corrected_first = first / (1.0 - settings.beta1.powi(updates));
+        let corrected_second = second / (1.0 - settings.beta2.powi(updates));
+        let step = rate * corrected_first / (corrected_second.sqrt() + settings.epsilon);
+        (
+            (parameter - step) * (1.0 - rate * settings.weight_decay),
+            first,
+            second,
+        )
+    }
+
+    /// `updates` steps of [`adamw_reference_step`] over a row of parameters and
+    /// a per-step row of gradients, `coupled` folding the decay into the
+    /// gradient and dropping the decay factor instead.
+    fn adamw_reference_run(
+        start: &[f64],
+        gradients: &[Vec<f64>],
+        rate: f64,
+        settings: AdamW,
+        coupled: bool,
+    ) -> Vec<f64> {
+        let mut parameters = start.to_vec();
+        let mut first = vec![0.0; start.len()];
+        let mut second = vec![0.0; start.len()];
+        let applied = if coupled {
+            AdamW {
+                weight_decay: 0.0,
+                ..settings
+            }
+        } else {
+            settings
+        };
+        for (update, row) in gradients.iter().enumerate() {
+            let index = i32::try_from(update + 1).expect("invariant: the reference runs few steps");
+            for j in 0..start.len() {
+                let gradient = if coupled {
+                    row[j] + settings.weight_decay * parameters[j]
+                } else {
+                    row[j]
+                };
+                let (next, moment, square) = adamw_reference_step(
+                    parameters[j],
+                    first[j],
+                    second[j],
+                    gradient,
+                    rate,
+                    index,
+                    applied,
+                );
+                parameters[j] = next;
+                first[j] = moment;
+                second[j] = square;
+            }
+        }
+        parameters
+    }
+
+    /// Bound on the deviation between [`Moments::advance`] and the hand
+    /// reference. The measured maximum over the cases of
+    /// `the_adamw_step_matches_a_two_step_hand_reference` and
+    /// `the_adamw_decay_is_decoupled_from_the_gradient` is 0.000000e0 — the
+    /// two agree bit-for-bit there — so this leaves room for the rounding a
+    /// different association of the same formulas would introduce.
+    const ADAMW_REFERENCE_TOLERANCE: f64 = 1e-14;
+
+    /// Parameters, per-step gradients and rate the AdamW hand references run
+    /// on: three entries of differing sign and magnitude, so the adaptive
+    /// normalization is not reading one scale.
+    fn adamw_case() -> (Vec<f64>, Vec<Vec<f64>>, f64) {
+        (
+            vec![0.7, -0.2, 1.3],
+            vec![
+                vec![0.4, -1.1, 0.02],
+                vec![-0.3, -0.9, 0.5],
+                vec![0.15, -0.4, -0.25],
+            ],
+            0.05,
+        )
+    }
+
+    /// Runs [`Moments::advance`] over `gradients` at `rate`, returning the
+    /// parameter row it leaves.
+    fn adamw_advance_run(
+        start: &[f64],
+        gradients: &[Vec<f64>],
+        rate: f64,
+        settings: AdamW,
+    ) -> DMatrix<f64> {
+        let width = start.len();
+        let mut moments = Moments::zeros(1, width);
+        let mut parameter = DMatrix::from_row_slice(1, width, start);
+        for row in gradients {
+            let gradient = DMatrix::from_row_slice(1, width, row);
+            let delta = moments.advance(&parameter, &gradient, rate, settings);
+            parameter -= delta;
+        }
+        parameter
+    }
+
+    /// Two decoupled AdamW updates land where the §B.3 formulas put them,
+    /// computed in the test from the moments, their bias correction, the
+    /// adaptive step and the decay. The parameters are asserted to have moved
+    /// by more than the tolerance the agreement is asserted at, so the match
+    /// is not one between two unmoved rows.
+    #[test]
+    fn the_adamw_step_matches_a_two_step_hand_reference() {
+        let settings = AdamW::default();
+        let (start, gradients, rate) = adamw_case();
+        let steps = &gradients[..2];
+
+        let observed = adamw_advance_run(&start, steps, rate, settings);
+        let expected = adamw_reference_run(&start, steps, rate, settings, false);
+
+        let mut worst = 0.0_f64;
+        let mut smallest_move = f64::INFINITY;
+        for (j, &reference) in expected.iter().enumerate() {
+            let deviation = (observed[(0, j)] - reference).abs();
+            worst = worst.max(deviation);
+            smallest_move = smallest_move.min((observed[(0, j)] - start[j]).abs());
+            assert!(
+                deviation < ADAMW_REFERENCE_TOLERANCE,
+                "entry {j} is {:.17e} after two updates, the hand reference puts it at \
+                 {reference:.17e} (deviation {deviation:.6e}, tolerance \
+                 {ADAMW_REFERENCE_TOLERANCE:e})",
+                observed[(0, j)]
+            );
+        }
+        println!(
+            "the_adamw_step_matches_a_two_step_hand_reference: max deviation {worst:.6e}, \
+             smallest entry movement {smallest_move:.6e}, reference {expected:?}"
+        );
+        assert!(
+            smallest_move > ADAMW_REFERENCE_TOLERANCE * 1e6,
+            "the least-moved entry travelled {smallest_move:.6e} over the two updates, so the \
+             agreement above would hold for an optimizer that does nothing"
+        );
+    }
+
+    /// The decay reaches the parameter without passing through the gradient:
+    /// [`Moments::advance`] matches the decoupled reference, while the coupled
+    /// alternative — the same optimizer with the decay folded into the gradient
+    /// and the decay factor dropped — lands measurably elsewhere, at the §B.3
+    /// decay 0.01 and at a larger one.
+    #[test]
+    fn the_adamw_decay_is_decoupled_from_the_gradient() {
+        let (start, gradients, rate) = adamw_case();
+        for weight_decay in [0.01, 0.25] {
+            let settings = AdamW {
+                weight_decay,
+                ..AdamW::default()
+            };
+            let observed = adamw_advance_run(&start, &gradients, rate, settings);
+            let decoupled = adamw_reference_run(&start, &gradients, rate, settings, false);
+            let coupled = adamw_reference_run(&start, &gradients, rate, settings, true);
+
+            let mut worst = 0.0_f64;
+            let mut separation = f64::INFINITY;
+            for (j, &reference) in decoupled.iter().enumerate() {
+                worst = worst.max((observed[(0, j)] - reference).abs());
+                separation = separation.min((reference - coupled[j]).abs());
+            }
+            println!(
+                "the_adamw_decay_is_decoupled_from_the_gradient: wd = {weight_decay}, max \
+                 deviation from the decoupled reference {worst:.6e}, least separation from the \
+                 coupled one {separation:.6e}"
+            );
+            assert!(
+                worst < ADAMW_REFERENCE_TOLERANCE,
+                "wd = {weight_decay}: the implementation deviates from the decoupled reference \
+                 by {worst:.6e}, tolerance {ADAMW_REFERENCE_TOLERANCE:e}"
+            );
+            assert!(
+                separation > ADAMW_REFERENCE_TOLERANCE * 1e4,
+                "wd = {weight_decay}: the coupled and decoupled references differ by only \
+                 {separation:.6e}, so the agreement above would hold for either path"
+            );
+        }
+    }
+
+    /// The §B.3 schedule at its four named points, from the closed form: zero
+    /// at step 0, the peak at the warm-up count (the first cosine step), half
+    /// the peak halfway through the cosine phase, and zero at the budget. The
+    /// rate is asserted non-decreasing over the warm-up and non-increasing
+    /// over the cosine phase, so a swapped branch does not pass on the
+    /// endpoints alone, and the warm-up lengths of the three budgets the §B.3
+    /// sweep runs are named. Steps past the budget pin at zero, and two
+    /// budgets whose warm-up consumes them whole pin the empty-cosine branch
+    /// at the peak.
+    #[test]
+    fn the_warmup_cosine_schedule_matches_its_closed_form() {
+        let fraction = AdamW::default().warmup_fraction;
+        for (budget, expected_warmup) in [(1_200_usize, 60_usize), (200, 10), (50, 3)] {
+            assert_eq!(
+                warmup_steps(budget, fraction),
+                expected_warmup,
+                "a {fraction} warm-up of {budget} steps is {} steps, expected {expected_warmup}",
+                warmup_steps(budget, fraction)
+            );
+        }
+
+        let peak = 0.01;
+        let budget = 200_usize;
+        let warmup = warmup_steps(budget, fraction);
+        let midpoint = warmup + (budget - warmup) / 2;
+        let named: [(&str, usize, f64); 4] = [
+            ("step 0", 0, 0.0),
+            ("warm-up end", warmup, peak),
+            ("cosine midpoint", midpoint, peak * 0.5),
+            ("budget", budget, 0.0),
+        ];
+        for (label, step, expected) in named {
+            let rate = scheduled_rate(step, budget, peak, fraction);
+            println!(
+                "the_warmup_cosine_schedule_matches_its_closed_form: {label} (step {step}) is \
+                 {rate:.17e}, expected {expected:.17e}"
+            );
+            assert!(
+                (rate - expected).abs() < 1e-15,
+                "{label} (step {step} of {budget}) is {rate:.17e}, the closed form gives \
+                 {expected:.17e}"
+            );
+        }
+
+        let mut previous = scheduled_rate(0, budget, peak, fraction);
+        for step in 1..=warmup {
+            let rate = scheduled_rate(step, budget, peak, fraction);
+            assert!(
+                rate >= previous,
+                "the warm-up fell from {previous:.9e} at step {} to {rate:.9e} at step {step}",
+                step - 1
+            );
+            previous = rate;
+        }
+        for step in warmup + 1..=budget {
+            let rate = scheduled_rate(step, budget, peak, fraction);
+            assert!(
+                rate <= previous,
+                "the cosine phase rose from {previous:.9e} at step {} to {rate:.9e} at step \
+                 {step}",
+                step - 1
+            );
+            previous = rate;
+        }
+        let last = scheduled_rate(budget - 1, budget, peak, fraction);
+        assert!(
+            last > 0.0 && last < peak,
+            "the last applied step's rate is {last:.9e}, outside (0, {peak})"
+        );
+
+        let beyond = scheduled_rate(budget + 7, budget, peak, fraction);
+        assert!(
+            beyond.abs() < 1e-15,
+            "step {} past the budget gives {beyond:.9e}, expected 0",
+            budget + 7
+        );
+        for (whole_budget, whole_fraction) in [(1_usize, fraction), (4, 0.9)] {
+            let warmup = warmup_steps(whole_budget, whole_fraction);
+            assert_eq!(
+                warmup, whole_budget,
+                "budget {whole_budget} at fraction {whole_fraction} leaves a cosine phase, so \
+                 this case no longer probes the empty-cosine branch"
+            );
+            for step in [whole_budget, whole_budget + 3] {
+                let rate = scheduled_rate(step, whole_budget, peak, whole_fraction);
+                assert!(
+                    (rate - peak).abs() < 1e-15,
+                    "with the warm-up consuming the whole budget, step {step} of \
+                     {whole_budget} gives {rate:.17e}, expected the peak {peak:.17e}"
+                );
+            }
+        }
+    }
+
+    /// Applied updates the weight-rate pins run.
+    const RATIO_STEPS: usize = 6;
+
+    /// Transition parameters at the production width: `ratio` as ρ, `init` as
+    /// W's initializer, and `optimizer` over [`RATIO_STEPS`] updates at
+    /// η = 0.01 with the tolerance held below anything the runs reach.
+    fn transition_params(init: WeightInit, ratio: f64, optimizer: Optimizer) -> Params {
+        Params {
+            learning_rate: 0.01,
+            max_steps: RATIO_STEPS,
+            tolerance: 1e-300,
+            regime: Regime::LearnableEmbedding,
+            weight_init: init,
+            weight_rate_ratio: ratio,
+            optimizer,
+            ..Params::default()
+        }
+    }
+
+    /// ρ = 0 leaves W bit-identical to its initialization over a whole run
+    /// under both optimizers, while E moves; ρ = 1 moves W, so the identity is
+    /// a property of the ratio rather than of a run that trains nothing.
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the claim is bit-identity of a frozen block, not numeric closeness"
+    )]
+    fn a_zero_weight_rate_leaves_the_weight_at_its_initialization() {
+        let graph = Graph::cycle(15).expect("cycle(15)");
+        for optimizer in [
+            Optimizer::GradientDescent,
+            Optimizer::AdamW(AdamW::default()),
+        ] {
+            let system = TinyNn::new(&graph).expect("TinyNn::new");
+            let frozen = transition_params(WeightInit::Gaussian, 0.0, optimizer);
+            let initial = system
+                .initial_parameters(&frozen, SEED)
+                .expect("initial_parameters");
+
+            let paths = (TempPath::new("rho0-history"), TempPath::new("rho0-cosines"));
+            let outputs = Outputs {
+                history: paths.0.path(),
+                cosines: paths.1.path(),
+            };
+            let held = run(&graph, &frozen, SEED, &outputs, || false).expect("run");
+            assert_eq!(
+                held.steps(),
+                RATIO_STEPS,
+                "{optimizer:?}: the run applied {} updates, expected {RATIO_STEPS}",
+                held.steps()
+            );
+
+            for (index, (left, right)) in held
+                .parameters()
+                .weight()
+                .iter()
+                .zip(initial.weight().iter())
+                .enumerate()
+            {
+                assert!(
+                    left == right,
+                    "{optimizer:?}: entry {index} of W is {left:e} after {RATIO_STEPS} updates \
+                     at rho = 0, {right:e} at the draw"
+                );
+            }
+            let embedding_move = (held.parameters().embedding() - initial.embedding()).amax();
+            println!(
+                "a_zero_weight_rate_leaves_the_weight_at_its_initialization: {optimizer:?}, \
+                 max |ΔE| {embedding_move:.6e}"
+            );
+            assert!(
+                embedding_move > 1e-9,
+                "{optimizer:?}: E moved by {embedding_move:.6e} at rho = 0, so the W identity \
+                 above would hold for a run that trains nothing"
+            );
+
+            let moving = transition_params(WeightInit::Gaussian, 1.0, optimizer);
+            let other = (TempPath::new("rho1-history"), TempPath::new("rho1-cosines"));
+            let moved = run(
+                &graph,
+                &moving,
+                SEED,
+                &Outputs {
+                    history: other.0.path(),
+                    cosines: other.1.path(),
+                },
+                || false,
+            )
+            .expect("run");
+            let weight_move = (moved.parameters().weight() - initial.weight()).amax();
+            assert!(
+                weight_move > 1e-9,
+                "{optimizer:?}: W moved by only {weight_move:.6e} at rho = 1, so the rho = 0 \
+                 identity above would hold at every ratio"
+            );
+        }
+    }
+
+    /// ρ = 1/2 puts W exactly where subtracting half of η times ∂L/∂W puts it,
+    /// against a reference built from the public gradient API, and away from
+    /// where ρ = 1 puts it.
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the claim is bit-identity against a hand-scaled reference, not numeric closeness"
+    )]
+    fn a_half_weight_rate_matches_a_hand_scaled_reference_step() {
+        let graph = Graph::cycle(15).expect("cycle(15)");
+        let system = TinyNn::new(&graph).expect("TinyNn::new");
+        let params = Params {
+            max_steps: 1,
+            ..transition_params(WeightInit::Gaussian, 0.5, Optimizer::GradientDescent)
+        };
+        let initial = system
+            .initial_parameters(&params, SEED)
+            .expect("initial_parameters");
+        let gradients = system
+            .gradients(&initial, params.activation, params.regime)
+            .expect("gradients");
+        let expected = initial.weight()
+            - gradients.weight() * (params.learning_rate * params.weight_rate_ratio);
+
+        let paths = (TempPath::new("rho-half-h"), TempPath::new("rho-half-c"));
+        let run = run(
+            &graph,
+            &params,
+            SEED,
+            &Outputs {
+                history: paths.0.path(),
+                cosines: paths.1.path(),
+            },
+            || false,
+        )
+        .expect("run");
+        assert_eq!(run.steps(), 1, "the run applied {} updates", run.steps());
+
+        for (index, (left, right)) in run
+            .parameters()
+            .weight()
+            .iter()
+            .zip(expected.iter())
+            .enumerate()
+        {
+            assert!(
+                left == right,
+                "entry {index} of W is {left:e} after the run's step, {right:e} in the \
+                 half-rate reference"
+            );
+        }
+        let full = initial.weight() - gradients.weight() * params.learning_rate;
+        let separation = (&expected - &full).amax();
+        println!(
+            "a_half_weight_rate_matches_a_hand_scaled_reference_step: the half-rate and \
+             full-rate references differ by {separation:.6e}"
+        );
+        assert!(
+            separation > 1e-9,
+            "the half-rate and full-rate references differ by only {separation:.6e}, so the \
+             match above would hold at either ratio"
+        );
+    }
+
+    /// Applied updates the AdamW ρ replay takes.
+    const ADAMW_RATIO_STEPS: usize = 8;
+
+    /// Under AdamW, ρ enters through W's rate: each step's W movement is
+    /// [`Moments::advance`] at ρ times the scheduled rate, pinned at ρ = 1/2
+    /// by a replay through the public gradient API and the moment state
+    /// directly. A ρ applied to the returned movement instead would land the
+    /// decoupled decay term measurably elsewhere at any ρ strictly between 0
+    /// and 1.
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the claim is bit-identity against the rate-scaled replay, not numeric closeness"
+    )]
+    fn the_adamw_weight_rate_enters_through_the_rate() {
+        let graph = Graph::cycle(15).expect("cycle(15)");
+        let system = TinyNn::new(&graph).expect("TinyNn::new");
+        let settings = AdamW::default();
+        let params = Params {
+            max_steps: ADAMW_RATIO_STEPS,
+            ..transition_params(WeightInit::Gaussian, 0.5, Optimizer::AdamW(settings))
+        };
+
+        let paths = (TempPath::new("adamw-rho-h"), TempPath::new("adamw-rho-c"));
+        let run = run(
+            &graph,
+            &params,
+            SEED,
+            &Outputs {
+                history: paths.0.path(),
+                cosines: paths.1.path(),
+            },
+            || false,
+        )
+        .expect("run");
+        assert_eq!(
+            run.steps(),
+            ADAMW_RATIO_STEPS,
+            "the run applied {} updates",
+            run.steps()
+        );
+
+        let mut replay = system
+            .initial_parameters(&params, SEED)
+            .expect("initial_parameters");
+        let mut weight_moments = Moments::zeros(params.width, params.width);
+        let mut embedding_moments = Moments::zeros(graph.order(), params.width);
+        for step in 0..ADAMW_RATIO_STEPS {
+            let gradients = system
+                .gradients(&replay, params.activation, params.regime)
+                .expect("gradients");
+            let rate = scheduled_rate(
+                step,
+                params.max_steps,
+                params.learning_rate,
+                settings.warmup_fraction,
+            );
+            let weight_move = weight_moments.advance(
+                &replay.weight,
+                gradients.weight(),
+                rate * params.weight_rate_ratio,
+                settings,
+            );
+            let embedding_move = embedding_moments.advance(
+                &replay.embedding,
+                gradients
+                    .embedding()
+                    .expect("a learnable-embedding run carries an embedding gradient"),
+                rate,
+                settings,
+            );
+            replay.weight -= weight_move;
+            replay.embedding -= embedding_move;
+        }
+
+        for (index, (observed, expected)) in run
+            .parameters()
+            .weight()
+            .iter()
+            .zip(replay.weight().iter())
+            .enumerate()
+        {
+            assert!(
+                observed == expected,
+                "entry {index} of W is {observed:e} after the run, {expected:e} in the \
+                 rate-scaled replay"
+            );
+        }
+        assert!(
+            run.parameters().embedding() == replay.embedding(),
+            "the replayed embedding diverges from the run's"
+        );
+    }
+
+    /// Applied updates the identity corner replays.
+    const IDENTITY_CORNER_STEPS: usize = 6;
+
+    /// The (identity W, ρ = 0) corner is dynamically Tier 1 for a whole short
+    /// run, not only at the draw: W stays bit-identical to the identity at
+    /// every step, and at each of them −∂L/∂E is Lemma 6's ascent direction CV
+    /// — the premise
+    /// `the_identity_weight_reproduces_the_tier1_ascent_direction` pins at
+    /// step 0. The hand replay's final parameters are asserted bit-identical to
+    /// [`run`]'s, so the steps checked are the ones the run took.
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the claims are bit-identity of a frozen block and of a replay, not numeric closeness"
+    )]
+    fn the_identity_corner_keeps_the_tier1_ascent_direction_along_the_run() {
+        let width = 12;
+        let identity = DMatrix::<f64>::identity(width, width);
+        for (name, graph) in d_graphs() {
+            let system = TinyNn::new(&graph).expect("TinyNn::new");
+            let tier1 = Node2Vec::new(&graph).expect("Node2Vec::new");
+            let params = Params {
+                width,
+                embedding_sigma: 0.5,
+                max_steps: IDENTITY_CORNER_STEPS,
+                ..transition_params(WeightInit::Identity, 0.0, Optimizer::GradientDescent)
+            };
+
+            let mut parameters = system
+                .initial_parameters(&params, SEED)
+                .expect("initial_parameters");
+            let mut worst = 0.0_f64;
+            let mut weakest = f64::INFINITY;
+            for step in 0..=IDENTITY_CORNER_STEPS {
+                for (index, (left, right)) in
+                    parameters.weight().iter().zip(identity.iter()).enumerate()
+                {
+                    assert!(
+                        left == right,
+                        "{name}: entry {index} of W is {left:e} at step {step}, {right:e} in the \
+                         identity it was initialized to"
+                    );
+                }
+                let gradients = system
+                    .gradients(&parameters, params.activation, params.regime)
+                    .expect("gradients");
+                let gradient = gradients
+                    .embedding()
+                    .expect("a learnable-embedding run carries an embedding gradient");
+                let ascent = tier1.gradient(parameters.embedding()).expect("gradient");
+                worst = worst.max((-gradient - &ascent).amax());
+                weakest = weakest.min(ascent.amax());
+                assert!(
+                    (-gradient - &ascent).amax() < 1e-12,
+                    "{name}: at step {step} the descent direction −∂L/∂E deviates from Lemma 6's \
+                     CV by {:.6e}",
+                    (-gradient - &ascent).amax()
+                );
+                if step < IDENTITY_CORNER_STEPS {
+                    parameters.embedding -= gradient * params.learning_rate;
+                }
+            }
+            println!(
+                "the_identity_corner_keeps_the_tier1_ascent_direction_along_the_run: {name}, \
+                 max deviation {worst:.6e} over {IDENTITY_CORNER_STEPS} steps, weakest \
+                 max |CV| {weakest:.6e}"
+            );
+            assert!(
+                weakest > 1e-3,
+                "{name}: Lemma 6's CV falls to {weakest:.6e} along the run, so the agreement \
+                 above would hold for a pair of near-zero matrices"
+            );
+
+            let paths = (TempPath::new("corner-h"), TempPath::new("corner-c"));
+            let run = run(
+                &graph,
+                &params,
+                SEED,
+                &Outputs {
+                    history: paths.0.path(),
+                    cosines: paths.1.path(),
+                },
+                || false,
+            )
+            .expect("run");
+            assert_eq!(
+                run.steps(),
+                IDENTITY_CORNER_STEPS,
+                "{name}: the run applied {} updates, expected {IDENTITY_CORNER_STEPS}",
+                run.steps()
+            );
+            for (block, left, right) in [
+                ("E", run.parameters().embedding(), parameters.embedding()),
+                ("W", run.parameters().weight(), parameters.weight()),
+            ] {
+                for (index, (left, right)) in left.iter().zip(right.iter()).enumerate() {
+                    assert!(
+                        left == right,
+                        "{name}: entry {index} of {block} is {left:e} in the run and {right:e} \
+                         in the replay the directions above were checked along"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Applied updates the AdamW replay runs.
+    const ADAMW_REPLAY_STEPS: usize = 12;
+
+    /// Replays `run` through the public [`TinyNn::gradients`], the schedule and
+    /// the moment state, asserting every step's loss matches the recorded one
+    /// bit-for-bit and returning the parameters the replay ends at.
+    fn adamw_public_gradient_replay(
+        system: &TinyNn,
+        params: &Params,
+        seed: u64,
+        settings: AdamW,
+        run: &Run,
+    ) -> Parameters {
+        let mut parameters = system
+            .initial_parameters(params, seed)
+            .expect("initial_parameters");
+        let mut weight = Moments::zeros(params.width, params.width);
+        let mut embedding = Moments::zeros(system.order(), params.width);
+        for step in 0..=params.max_steps {
+            let replayed = system.loss(&parameters, params.activation).expect("loss");
+            let recorded = run.records()[step].loss();
+            assert!(
+                replayed.to_bits() == recorded.to_bits(),
+                "the replay diverges at step {step}: loss {replayed:e} against the recorded \
+                 {recorded:e}, so the run consumed a gradient this path does not"
+            );
+            if step == params.max_steps {
+                break;
+            }
+            let gradients = system
+                .gradients(&parameters, params.activation, params.regime)
+                .expect("gradients");
+            let rate = scheduled_rate(
+                step,
+                params.max_steps,
+                params.learning_rate,
+                settings.warmup_fraction,
+            );
+            let weight_delta = weight.advance(
+                parameters.weight(),
+                gradients.weight(),
+                rate * params.weight_rate_ratio,
+                settings,
+            );
+            let embedding_delta = embedding.advance(
+                parameters.embedding(),
+                gradients
+                    .embedding()
+                    .expect("a learnable-embedding run carries an embedding gradient"),
+                rate,
+                settings,
+            );
+            parameters.weight -= weight_delta;
+            parameters.embedding -= embedding_delta;
+        }
+        parameters
+    }
+
+    /// The AdamW path consumes the gradients the finite-difference pins cover
+    /// and no others: replaying a run through the public
+    /// [`TinyNn::gradients`] — the entry point
+    /// `gradients_match_central_differences_on_every_d_graph` probes at
+    /// m = 16 — plus [`scheduled_rate`] and [`Moments::advance`] reproduces
+    /// every recorded loss and the final parameters bit-for-bit. The run is
+    /// asserted to reach its step limit, so the schedule's zero-rate first step
+    /// is not read as convergence.
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the claim is bit-identity of a replayed trajectory, not numeric closeness"
+    )]
+    fn the_adamw_path_consumes_the_finite_difference_checked_gradients() {
+        let settings = AdamW::default();
+        for (name, graph) in d_graphs() {
+            let system = TinyNn::new(&graph).expect("TinyNn::new");
+            let params = Params {
+                learning_rate: 0.01,
+                max_steps: ADAMW_REPLAY_STEPS,
+                optimizer: Optimizer::AdamW(settings),
+                ..fd_params(16, 0.35, Activation::Linear)
+            };
+
+            let paths = (TempPath::new("adamw-h"), TempPath::new("adamw-c"));
+            let run = run(
+                &graph,
+                &params,
+                SEED,
+                &Outputs {
+                    history: paths.0.path(),
+                    cosines: paths.1.path(),
+                },
+                || false,
+            )
+            .expect("run");
+            assert_eq!(
+                run.steps(),
+                ADAMW_REPLAY_STEPS,
+                "{name}: the run applied {} updates, expected the {ADAMW_REPLAY_STEPS}-step \
+                 limit; a zero-rate warm-up step read as convergence would stop it at 0",
+                run.steps()
+            );
+            assert_eq!(
+                run.stop_reason(),
+                StopReason::StepLimit,
+                "{name}: the run stopped for {:?}, expected the step limit",
+                run.stop_reason()
+            );
+
+            let parameters = adamw_public_gradient_replay(&system, &params, SEED, settings, &run);
+
+            for (block, left, right) in [
+                ("E", run.parameters().embedding(), parameters.embedding()),
+                ("W", run.parameters().weight(), parameters.weight()),
+            ] {
+                for (index, (left, right)) in left.iter().zip(right.iter()).enumerate() {
+                    assert!(
+                        left == right,
+                        "{name}: entry {index} of {block} is {left:e} in the run and {right:e} \
+                         in the public-gradient replay"
+                    );
+                }
+            }
+            let moved = (run.parameters().embedding()
+                - system
+                    .initial_parameters(&params, SEED)
+                    .expect("initial_parameters")
+                    .embedding())
+            .amax();
+            println!(
+                "the_adamw_path_consumes_the_finite_difference_checked_gradients: {name}, \
+                 max |ΔE| over {ADAMW_REPLAY_STEPS} AdamW steps {moved:.6e}"
+            );
+            assert!(
+                moved > 1e-6,
+                "{name}: E moved {moved:.6e} over the run, so the replay agreement above would \
+                 hold for a trajectory that never left its draw"
+            );
+        }
+    }
+
+    /// The geometry stop ends the run at the first recorded step meeting its
+    /// threshold. `TinyNn::fiedler_alignment` documents a range of [0, 1], so a
+    /// threshold of 0 is met by the initial record and one of 2 by none: the
+    /// first run stops at step 0 with [`StopReason::Aligned`], the second
+    /// spends its whole budget and stops at the step limit.
+    #[test]
+    fn the_alignment_stop_ends_the_run_at_the_first_step_that_meets_it() {
+        let budget = 4;
+        for (name, graph) in d_graphs() {
+            let system = TinyNn::new(&graph).expect("TinyNn::new");
+            let base = transition_params(WeightInit::Gaussian, 1.0, Optimizer::GradientDescent);
+            let draw = system
+                .initial_parameters(&base, SEED)
+                .expect("initial_parameters");
+            let initial_alignment = system
+                .fiedler_alignment(draw.embedding())
+                .expect("fiedler_alignment");
+
+            for (label, threshold, steps, expected, expected_outcome) in [
+                (
+                    "met at once",
+                    0.0,
+                    0_usize,
+                    StopReason::Aligned,
+                    Outcome::Stopped,
+                ),
+                (
+                    "met exactly at the draw's own alignment",
+                    initial_alignment,
+                    0,
+                    StopReason::Aligned,
+                    Outcome::Stopped,
+                ),
+                (
+                    "never met",
+                    1.0,
+                    budget,
+                    StopReason::StepLimit,
+                    Outcome::StepLimit,
+                ),
+            ] {
+                let params = Params {
+                    alignment_stop: Some(threshold),
+                    max_steps: budget,
+                    ..transition_params(WeightInit::Gaussian, 1.0, Optimizer::GradientDescent)
+                };
+                let paths = (TempPath::new("stop-h"), TempPath::new("stop-c"));
+                let run = run(
+                    &graph,
+                    &params,
+                    SEED,
+                    &Outputs {
+                        history: paths.0.path(),
+                        cosines: paths.1.path(),
+                    },
+                    || false,
+                )
+                .expect("run");
+                assert_eq!(
+                    run.stop_reason(),
+                    expected,
+                    "{name} {label}: the run stopped for {:?} after {} steps, expected \
+                     {expected:?}",
+                    run.stop_reason(),
+                    run.steps()
+                );
+                assert_eq!(
+                    run.outcome(),
+                    expected_outcome,
+                    "{name} {label}: the run's outcome is {:?}, expected {expected_outcome:?}",
+                    run.outcome()
+                );
+                assert_eq!(
+                    run.steps(),
+                    steps,
+                    "{name} {label}: the run applied {} updates, expected {steps}",
+                    run.steps()
+                );
+                assert_eq!(
+                    run.records().len(),
+                    steps + 1,
+                    "{name} {label}: the run recorded {} steps, expected {}",
+                    run.records().len(),
+                    steps + 1
+                );
+            }
+        }
+    }
+
+    /// Applied updates the determinism pins compare.
+    const TRANSITION_TRAJECTORY_STEPS: usize = 10;
+
+    /// Runs `params` at `seed` and at `seed + 1`, asserting the same seed
+    /// reproduces the parameters, the records and both CSVs bit for bit and
+    /// that the other seed does not.
+    #[allow(
+        clippy::float_cmp,
+        reason = "the claim is bit-identity of a deterministic trajectory, not numeric closeness"
+    )]
+    fn assert_trajectory_is_reproducible(label: &str, graph: &Graph, params: &Params, seed: u64) {
+        let paths: Vec<(TempPath, TempPath)> = (0..3)
+            .map(|index| {
+                (
+                    TempPath::new(&format!("{label}-{index}-h")),
+                    TempPath::new(&format!("{label}-{index}-c")),
+                )
+            })
+            .collect();
+        let runs: Vec<Run> = [seed, seed, seed + 1]
+            .into_iter()
+            .zip(&paths)
+            .map(|(seed, paths)| {
+                run(
+                    graph,
+                    params,
+                    seed,
+                    &Outputs {
+                        history: paths.0.path(),
+                        cosines: paths.1.path(),
+                    },
+                    || false,
+                )
+                .expect("run")
+            })
+            .collect();
+
+        assert_eq!(
+            runs[0].steps(),
+            params.max_steps,
+            "{label}: ran {} steps, expected the {}-step limit",
+            runs[0].steps(),
+            params.max_steps
+        );
+        for (block, left, right) in [
+            (
+                "E",
+                runs[0].parameters().embedding(),
+                runs[1].parameters().embedding(),
+            ),
+            (
+                "W",
+                runs[0].parameters().weight(),
+                runs[1].parameters().weight(),
+            ),
+        ] {
+            for (index, (left, right)) in left.iter().zip(right.iter()).enumerate() {
+                assert!(
+                    left == right,
+                    "{label}: entry {index} of {block} is {left:e} on the first run and \
+                     {right:e} on the second, at seed {seed}"
+                );
+            }
+        }
+        assert_eq!(
+            runs[0].records(),
+            runs[1].records(),
+            "{label}: the two same-seed runs recorded different histories"
+        );
+        for (file, first, second) in [
+            ("history", paths[0].0.path(), paths[1].0.path()),
+            ("cosine", paths[0].1.path(), paths[1].1.path()),
+        ] {
+            assert_eq!(
+                std::fs::read(first).expect("read CSV"),
+                std::fs::read(second).expect("read CSV"),
+                "{label}: the two same-seed runs wrote different {file} CSVs"
+            );
+        }
+
+        let deviation =
+            (runs[0].parameters().embedding() - runs[2].parameters().embedding()).amax();
+        assert!(
+            deviation > 0.0,
+            "{label}: seeds {seed} and {} produced an identical E (max |Δ| = {deviation:e}), so \
+             the comparison above would hold for any seed",
+            seed + 1
+        );
+    }
+
+    /// A W-sweep configuration at the same seed reproduces its trajectory bit
+    /// for bit, and a different seed does not.
+    #[test]
+    fn the_same_seed_reproduces_a_w_sweep_trajectory_bit_for_bit() {
+        let params = Params {
+            max_steps: TRANSITION_TRAJECTORY_STEPS,
+            ..transition_params(WeightInit::Identity, 0.5, Optimizer::GradientDescent)
+        };
+        for (name, graph) in d_graphs() {
+            assert_trajectory_is_reproducible(name, &graph, &params, SEED);
+        }
+    }
+
+    /// An AdamW configuration at the same seed reproduces its trajectory bit
+    /// for bit, and a different seed does not.
+    #[test]
+    fn the_same_seed_reproduces_an_adamw_trajectory_bit_for_bit() {
+        let params = Params {
+            max_steps: TRANSITION_TRAJECTORY_STEPS,
+            ..transition_params(
+                WeightInit::Gaussian,
+                1.0,
+                Optimizer::AdamW(AdamW::default()),
+            )
+        };
+        for (name, graph) in d_graphs() {
+            assert_trajectory_is_reproducible(name, &graph, &params, SEED);
+        }
+    }
+
+    /// A `Some` geometry-stop threshold outside [0, 1] — the range
+    /// [`TinyNn::fiedler_alignment`] takes values in — is rejected as
+    /// [`Error::RunParameterNotAFraction`]; the boundary values 0, 0.75 and 1
+    /// pass.
+    #[test]
+    fn the_alignment_stop_threshold_is_validated() {
+        let base = Params::default();
+        for value in [-1.0, f64::NAN, f64::INFINITY, 2.0] {
+            let params = Params {
+                alignment_stop: Some(value),
+                ..base
+            };
+            match params.validate() {
+                Err(Error::RunParameterNotAFraction { parameter, .. }) => {
+                    assert_eq!(
+                        parameter, "alignment_stop",
+                        "rejected parameter {parameter:?} for alignment_stop {value}"
+                    );
+                }
+                other => panic!(
+                    "expected RunParameterNotAFraction for alignment_stop {value}, got {other:?}"
+                ),
+            }
+        }
+        for value in [0.0, 0.75, 1.0] {
+            let params = Params {
+                alignment_stop: Some(value),
+                ..base
+            };
+            assert!(
+                params.validate().is_ok(),
+                "alignment_stop {value} is inside [0, 1] and was rejected"
+            );
+        }
+    }
+
+    /// The transition knobs come back as typed errors naming the field.
+    #[test]
+    fn the_transition_parameters_reject_degenerate_values() {
+        let base = Params::default();
+        for (parameter, value) in [("weight_rate_ratio", -0.5), ("weight_rate_ratio", f64::NAN)] {
+            let params = Params {
+                weight_rate_ratio: value,
+                ..base
+            };
+            match params.validate() {
+                Err(Error::NegativeRunParameter {
+                    parameter: observed,
+                    ..
+                }) => {
+                    assert_eq!(
+                        observed, parameter,
+                        "rejected parameter {observed:?}, expected {parameter:?}"
+                    );
+                }
+                other => panic!("expected NegativeRunParameter for {parameter}, got {other:?}"),
+            }
+        }
+
+        let decayed = Params {
+            optimizer: Optimizer::AdamW(AdamW {
+                weight_decay: -1.0,
+                ..AdamW::default()
+            }),
+            ..base
+        };
+        match decayed.validate() {
+            Err(Error::NegativeRunParameter { parameter, .. }) => {
+                assert_eq!(
+                    parameter, "weight_decay",
+                    "rejected parameter {parameter:?}"
+                );
+            }
+            other => panic!("expected NegativeRunParameter for weight_decay, got {other:?}"),
+        }
+
+        for (parameter, settings) in [
+            (
+                "beta1",
+                AdamW {
+                    beta1: 1.0,
+                    ..AdamW::default()
+                },
+            ),
+            (
+                "beta2",
+                AdamW {
+                    beta2: -0.1,
+                    ..AdamW::default()
+                },
+            ),
+            (
+                "warmup_fraction",
+                AdamW {
+                    warmup_fraction: f64::INFINITY,
+                    ..AdamW::default()
+                },
+            ),
+        ] {
+            let params = Params {
+                optimizer: Optimizer::AdamW(settings),
+                ..base
+            };
+            match params.validate() {
+                Err(Error::RunParameterNotAFraction {
+                    parameter: observed,
+                    ..
+                }) => {
+                    assert_eq!(
+                        observed, parameter,
+                        "rejected parameter {observed:?}, expected {parameter:?}"
+                    );
+                }
+                other => panic!("expected RunParameterNotAFraction for {parameter}, got {other:?}"),
+            }
+        }
+
+        let epsilon = Params {
+            optimizer: Optimizer::AdamW(AdamW {
+                epsilon: 0.0,
+                ..AdamW::default()
+            }),
+            ..base
+        };
+        match epsilon.validate() {
+            Err(Error::InvalidRunParameter { parameter, .. }) => {
+                assert_eq!(parameter, "epsilon", "rejected parameter {parameter:?}");
+            }
+            other => panic!("expected InvalidRunParameter for epsilon, got {other:?}"),
+        }
+
+        assert!(
+            base.validate().is_ok(),
+            "the default parameters are rejected, so the errors above would fire on every input"
         );
     }
 }

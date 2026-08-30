@@ -49,6 +49,12 @@ pub enum Error {
     #[error("run parameter `{parameter}` must be positive and finite, got {value}")]
     InvalidRunParameter { parameter: &'static str, value: f64 },
 
+    #[error("run parameter `{parameter}` must be non-negative and finite, got {value}")]
+    NegativeRunParameter { parameter: &'static str, value: f64 },
+
+    #[error("run parameter `{parameter}` must lie in [0, 1), got {value}")]
+    RunParameterNotAFraction { parameter: &'static str, value: f64 },
+
     #[error("embedding dimension must be at least 1, got {dimension}")]
     InvalidDimension { dimension: usize },
 
