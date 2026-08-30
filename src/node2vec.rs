@@ -22,12 +22,11 @@ use std::ops::Range;
 use std::path::Path;
 
 use nalgebra::DMatrix;
-use rand::SeedableRng;
-use rand::distr::{Distribution, OpenClosed01};
-use rand_chacha::ChaCha20Rng;
 
 use crate::error::{Error, Result};
 use crate::graph::Graph;
+use crate::numerics::{gaussian_matrix, row_softmax, weighted_log_likelihood};
+use crate::output::write_matrix_csv;
 use crate::spectral::{Spectrum, symmetrize, transition};
 
 /// Eigenvalue gap below which two eigenvalues of −L count as one degenerate
@@ -148,24 +147,14 @@ impl Node2Vec {
     /// `usize`.
     pub fn initial_embedding(&self, params: &Params, seed: u64) -> Result<DMatrix<f64>> {
         params.validate()?;
-        let entries = self
-            .order
+        self.order
             .checked_mul(params.dimension)
             .ok_or(Error::EmbeddingTooLarge {
                 rows: self.order,
                 columns: params.dimension,
             })?;
 
-        let mut rng = ChaCha20Rng::seed_from_u64(seed);
-        let mut values = Vec::with_capacity(entries);
-        for _ in 0..entries {
-            values.push(params.sigma * standard_normal(&mut rng));
-        }
-        Ok(DMatrix::from_row_iterator(
-            self.order,
-            params.dimension,
-            values,
-        ))
+        gaussian_matrix(self.order, params.dimension, params.sigma, seed)
     }
 
     /// Computes P = row_softmax(VVᵀ) of Eq. 2, each row shifted by its
@@ -193,24 +182,10 @@ impl Node2Vec {
     /// have one row per vertex.
     pub fn objective(&self, embedding: &DMatrix<f64>) -> Result<f64> {
         self.check_order(embedding)?;
-        Ok(self.cross_entropy(&(embedding * embedding.transpose())))
-    }
-
-    /// Evaluates Σ_i Σ_j W_ij (logits_ij − log Σ_k exp logits_ik) for a
-    /// matrix of logits, each row's log-partition shifted by that row's
-    /// maximum.
-    fn cross_entropy(&self, logits: &DMatrix<f64>) -> f64 {
-        let mut total = 0.0;
-        for i in 0..self.order {
-            let log_partition = log_sum_exp(logits, i);
-            for j in 0..self.order {
-                let weight = self.walk[(i, j)];
-                if weight > 0.0 {
-                    total += weight * (logits[(i, j)] - log_partition);
-                }
-            }
-        }
-        total
+        Ok(weighted_log_likelihood(
+            &self.walk,
+            &(embedding * embedding.transpose()),
+        ))
     }
 
     /// Computes Lemma 6's coefficient matrix C = (W − P) + (W − P)ᵀ from a
@@ -251,7 +226,10 @@ impl Node2Vec {
     /// factors differ in shape.
     pub fn untied_objective(&self, first: &DMatrix<f64>, second: &DMatrix<f64>) -> Result<f64> {
         self.check_pair(first, second)?;
-        Ok(self.cross_entropy(&(first * second.transpose())))
+        Ok(weighted_log_likelihood(
+            &self.walk,
+            &(first * second.transpose()),
+        ))
     }
 
     /// Computes P = row_softmax(V₁V₂ᵀ) for the weight-untied variant.
@@ -310,35 +288,6 @@ impl Node2Vec {
             })
         }
     }
-}
-
-/// One draw from N(0, 1) by the Box–Muller transform, consuming two uniforms
-/// from `rng` on the half-open interval (0, 1].
-fn standard_normal<R: rand::Rng + ?Sized>(rng: &mut R) -> f64 {
-    let radial: f64 = OpenClosed01.sample(rng);
-    let angular: f64 = OpenClosed01.sample(rng);
-    (-2.0 * radial.ln()).sqrt() * (std::f64::consts::TAU * angular).cos()
-}
-
-/// Row `i`'s log Σ_k exp, shifted by that row's maximum before exponentiating.
-fn log_sum_exp(logits: &DMatrix<f64>, i: usize) -> f64 {
-    let row = logits.row(i);
-    let peak = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let shifted: f64 = row.iter().map(|entry| (entry - peak).exp()).sum();
-    peak + shifted.ln()
-}
-
-/// Applies a row-wise softmax to `logits`, shifting each row by its maximum
-/// before exponentiating.
-fn row_softmax(logits: &DMatrix<f64>) -> DMatrix<f64> {
-    let mut probabilities = logits.clone();
-    for mut row in probabilities.row_iter_mut() {
-        let peak = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        row.apply(|entry| *entry = (*entry - peak).exp());
-        let total = row.sum();
-        row /= total;
-    }
-    probabilities
 }
 
 /// The node-node cosine-similarity matrix of `embedding`, entry (i, j) being
@@ -897,27 +846,6 @@ fn write_untied_row<W: Write>(sink: &mut W, record: &UntiedStepRecord) -> Result
         write!(sink, ",{value}")?;
     }
     writeln!(sink)?;
-    Ok(())
-}
-
-/// Writes `matrix` to `path` as one CSV row per matrix row, with a
-/// `column_j` header.
-fn write_matrix_csv(path: &Path, matrix: &DMatrix<f64>) -> Result<()> {
-    let mut sink = BufWriter::new(File::create(path)?);
-    write!(sink, "row")?;
-    for j in 0..matrix.ncols() {
-        write!(sink, ",column_{j}")?;
-    }
-    writeln!(sink)?;
-
-    for i in 0..matrix.nrows() {
-        write!(sink, "{i}")?;
-        for j in 0..matrix.ncols() {
-            write!(sink, ",{}", matrix[(i, j)])?;
-        }
-        writeln!(sink)?;
-    }
-    sink.flush()?;
     Ok(())
 }
 

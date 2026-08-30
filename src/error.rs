@@ -66,6 +66,19 @@ pub enum Error {
 
     #[error("run parameter `max_steps` must be at least 1, got 0")]
     ZeroMaxSteps,
+
+    #[error("a {rows}×{columns} matrix is beyond the representable range")]
+    MatrixTooLarge { rows: usize, columns: usize },
+
+    #[error("weight matrix is {rows}×{columns}, expected {width}×{width}")]
+    WeightShapeMismatch {
+        rows: usize,
+        columns: usize,
+        width: usize,
+    },
+
+    #[error("graph has vertex pairs at {available} distinct distances, {required} required")]
+    InsufficientDistanceShells { available: usize, required: usize },
 }
 
 /// Crate-wide result alias over [`Error`].

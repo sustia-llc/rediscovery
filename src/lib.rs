@@ -6,8 +6,11 @@ pub mod error;
 pub mod graph;
 pub mod logger;
 pub mod node2vec;
+pub mod numerics;
+pub mod output;
 pub mod settings;
 pub mod spectral;
+pub mod tinynn;
 
 pub mod subsystems {
     pub mod runner;
