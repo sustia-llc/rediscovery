@@ -39,6 +39,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The issue-#5 transition machinery (#5): additive `Params` fields —
+  `weight_init` (identity or the committed Gaussian), `weight_rate_ratio`
+  (ρ = η_W/η_E), an `optimizer` carrying a hand-rolled decoupled AdamW with
+  a linear-warmup-then-cosine schedule, and an `alignment_stop` geometry
+  stop reported through `StopReason`/`Run::stop_reason` — plus
+  `examples/tier2_transition.rs`, which runs the 64-run W-sweep and the
+  24-run §B.3 arm and writes per-run and summary CSVs. The AdamW
+  implementation matches a two-step hand reference bit-for-bit; the ρ
+  placement, schedule closed form and boundaries, stop mappings, threshold
+  validation and same-seed bit-identity are pinned and falsified; a
+  falsifying review's 6 important and 5 minor findings are applied.
 - A sampled central-differences pin at the production width m = 512 (#5):
   64 seeded entries per block, both blocks and both activations on all four
   D-graphs, measured max deviation 2.147e-9 against a 1e-7 tolerance with a
@@ -60,6 +71,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matrix-CSV writer that Tiers 1 and 2 share.
 
 ### Findings (Tier 2)
+
+- **The spectral geometry is decided by W's initialization, not by its
+  trainability (#5).** Sweeping the learnable regime at η = 0.01 over
+  W(0) ∈ {identity, the committed N(0, 1/m)} × ρ = η_W/η_E ∈ {0, 1/8, 1/2,
+  1} on the four D-graphs at both seeds (`examples/tier2_transition.rs`):
+  all 32 identity-initialized runs cross the 0.75 criterion within 7–35
+  steps — including ρ = 1, where W trains as freely as in the committed
+  regime — with top-d scores still 0.40–0.65 at the crossing (the geometry
+  stop truncates those runs there, so their memorization columns describe
+  truncated runs). None of the 32 Gaussian-initialized runs crosses within
+  20,000 steps at any ρ, ρ = 0 included; all reach top-d 1.0 (steps 2–664)
+  and peak at alignment 0.032–0.657. §4.4's weight-tying reading and issue
+  #5's trainable-middle-layer suspect both miss at these knobs; the
+  initializer — which §B.2.2 does not state — is the variable.
+- **§B.3's optimizer does not recover the geometry (#5).** Decoupled AdamW
+  (wd 0.01 per §B.3; β₁ = 0.9, β₂ = 0.999, ε = 1e-8 and a 5 % linear warmup
+  into cosine decay as documented knobs §B.3 leaves unstated) on the
+  committed initializer at the committed budgets {(0.001, 1200),
+  (0.01, 200), (0.1, 50)}: all 24 runs end at their step limit below the
+  criterion (peaks 0.068–0.508) while memorizing at steps 2–9. Issue #5's
+  optimizer suspect is eliminated at these budgets.
 
 > **History.** The first Tier-2 geometry measure was a shell-based cosine
 > criterion. An adversarial review found it unsound — it read only shells 2
