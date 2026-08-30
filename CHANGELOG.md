@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The Tier-2 sweep loops — the 24-configuration timing sweep, the
+  12-configuration learnable sweep, the frozen-run test and the example's
+  learnable runs — fan out across runs on 6-worker scoped rayon pools
+  (dev-dependency; `src/` stays rayon-free) (#5). Per-run arithmetic is
+  untouched: the masked sweep output diffs empty against the sequential
+  baseline and all 36 example CSVs are byte-identical. Measured: lib binary
+  32.4 → 17.7 s, tier-2 integration binary 60.6 → 28.3 s, example
+  126 → 53 s; the sweep itself parallelizes 2.09× against the 3.57× the
+  pre-#6 arithmetic gave, the per-step compute having halved against the
+  same memory traffic. A panicking configuration re-raises after the
+  surviving configurations' measurement lines print.
+
 - Tier 2 `TinyNn::gradients_of` computes its two transposed-side products as
   `A.transpose() * B` instead of `A.tr_mul(B)`, routing them through
   nalgebra's gemm path rather than its per-entry column-dot loop
@@ -27,6 +39,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A sampled central-differences pin at the production width m = 512 (#5):
+  64 seeded entries per block, both blocks and both activations on all four
+  D-graphs, measured max deviation 2.147e-9 against a 1e-7 tolerance with a
+  1e-4 non-vacuity floor on the sampled |analytic|. Falsified by an operand
+  swap (6.06e-4 red) and a sign flip (1.25e-3 red), and a defect on a
+  sampled column went red at 1.0e-3 — while a +1e-3 defect confined to an
+  unsampled column measured red nowhere in the lib binary, the coverage
+  being 64 of the 262 144 W entries, which the pin's doc states as a seeded
+  sample.
 - Tier 2 `TinyNn`: the §B.2.2 model as Z = E W Eᵀ with a tied 512-wide
   embedding and one trainable weight matrix, in frozen-E and learnable-E
   regimes over the same degree-normalized cross-entropy Tier 1 uses.
