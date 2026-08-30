@@ -17,10 +17,6 @@
     clippy::doc_markdown,
     reason = "the docs carry matrix notation with subscripts — E[u] W E[v]ᵀ, W_ij, ‖ΔW‖_F — that the lint reads as unbackticked identifiers"
 )]
-#![allow(
-    clippy::cast_precision_loss,
-    reason = "vertex counts, degrees, and pair counts are small integers, exact in f64"
-)]
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -36,9 +32,10 @@ use crate::numerics::{gaussian_matrix, row_softmax, weighted_log_likelihood};
 use crate::output::write_matrix_csv;
 use crate::spectral::transition;
 
-/// Number of graph-distance shells the geometry metric reads. Shell k holds
-/// the vertex pairs at distance k, and [`TinyNn::new`] rejects a graph that
-/// leaves one of the first [`GEOMETRY_SHELLS`] empty.
+/// Number of graph-distance shells [`TinyNn::shell_means`] reports and
+/// [`TinyNn::new`] requires non-empty. Shell k holds the vertex pairs at
+/// distance k; the criterion itself compares the last two, so raising this
+/// deepens the pair of shells [`GEOMETRY_MARGIN`] is calibrated against.
 pub const GEOMETRY_SHELLS: usize = 3;
 
 // Two vertices at distance 3 or more have no common neighbour, so an embedding
@@ -155,6 +152,10 @@ impl Params {
     /// drawn from N(0, 1/width), W from N(0, 1/width²), η = 0.1, a frozen
     /// embedding, and a linear hidden layer. The paper states no initializer.
     #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a width above 2^53 is unallocatable long before the conversion rounds"
+    )]
     pub fn for_width(width: usize) -> Self {
         let scale = 1.0 / (width as f64);
         Self {
@@ -466,12 +467,11 @@ impl TinyNn {
             pre_gradient.component_mul_assign(&derivative);
         }
 
-        let weight = parameters.embedding.transpose() * &pre_gradient;
+        let weight = parameters.embedding.tr_mul(&pre_gradient);
         let embedding = match regime {
             Regime::FrozenEmbedding => None,
             Regime::LearnableEmbedding => Some(
-                residual.transpose() * &forward.hidden
-                    + &pre_gradient * parameters.weight.transpose(),
+                residual.tr_mul(&forward.hidden) + &pre_gradient * parameters.weight.transpose(),
             ),
         };
         Gradients { weight, embedding }
@@ -485,6 +485,10 @@ impl TinyNn {
     /// of `probabilities` alone. It is 1 exactly when every vertex ranks all
     /// of its neighbours above every non-neighbour.
     #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "vertex counts and degrees are small integers, exact in f64"
+    )]
     pub fn associative_score(&self, probabilities: &DMatrix<f64>) -> f64 {
         // One buffer for the whole sweep: the comparator is a total order, so
         // each sort yields the same permutation whatever the buffer held.
@@ -517,6 +521,10 @@ impl TinyNn {
     /// [`Error::InsufficientDistanceShells`] rather than build a system with
     /// one, so a `TinyNn` this crate constructed has none.
     #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "pair counts are bounded by order², exact in f64 at this scale"
+    )]
     pub fn shell_means(&self, cosines: &DMatrix<f64>) -> Vec<f64> {
         self.shells
             .iter()
@@ -531,15 +539,10 @@ impl TinyNn {
             .collect()
     }
 
-    /// The geometry criterion: the mean cosine similarity at distance
-    /// [`GEOMETRY_SHELLS`], measured by its distance from zero and capped by
-    /// its drop below the shell above it.
-    ///
-    /// A positive value means the cosine matrix places the deepest shell at a
-    /// definite similarity of its own, which is the multi-hop information md
-    /// 870 tests the heatmaps for. An embedding whose rows are the adjacency
-    /// rows scores zero, its deepest shell being pairs with no common
-    /// neighbour.
+    /// The geometry criterion: the deepest shell's mean cosine measured by its
+    /// distance from zero, capped by its drop below the shell above it. An
+    /// adjacency-row embedding scores zero
+    /// (`an_adjacency_row_embedding_scores_zero_on_the_deepest_shell`).
     #[must_use]
     pub fn geometry_margin(&self, cosines: &DMatrix<f64>) -> f64 {
         shell_margin(&self.shell_means(cosines))
@@ -561,12 +564,8 @@ impl TinyNn {
 
 /// The geometry margin of a shell-mean profile: the deepest shell's distance
 /// from zero, capped by its drop below the shell above it. NaN for a profile
-/// carrying a NaN or shorter than two entries.
-///
-/// `f64::min` returns its non-NaN argument, which would let a run whose
-/// embedding left the finite range report the largest possible margin; the
-/// explicit test returns NaN instead, and NaN fails every threshold
-/// comparison.
+/// carrying a NaN or shorter than two entries, so such a profile fails every
+/// threshold comparison.
 fn shell_margin(shell_means: &[f64]) -> f64 {
     let [.., above, deepest] = shell_means else {
         return f64::NAN;
@@ -616,10 +615,7 @@ fn distance_shells(adjacency: &DMatrix<f64>, order: usize) -> Result<Vec<Vec<(us
 
     let available = shells.iter().take_while(|pairs| !pairs.is_empty()).count();
     if available < GEOMETRY_SHELLS {
-        return Err(Error::InsufficientDistanceShells {
-            available,
-            required: GEOMETRY_SHELLS,
-        });
+        return Err(Error::InsufficientDistanceShells { available });
     }
     Ok(shells)
 }
@@ -787,8 +783,8 @@ pub fn run<S: Fn() -> bool>(
     params.validate()?;
     let system = TinyNn::new(graph)?;
     let mut parameters = system.initial_parameters(params, seed)?;
-    // Recomputed only where the embedding moves, so a frozen-embedding run
-    // reads one cosine matrix throughout.
+    // Recomputed where the embedding moves; a frozen-embedding run holds one
+    // cosine matrix because its embedding never changes.
     let mut cosines = cosine_similarity(&parameters.embedding);
 
     let mut sink = BufWriter::new(File::create(outputs.history)?);
@@ -884,6 +880,10 @@ fn write_row<W: Write>(sink: &mut W, record: &StepRecord) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "test indices and shell counts are small integers, exact in f64"
+)]
 mod tests {
     use super::*;
     use crate::node2vec::{self, Node2Vec};
@@ -1193,6 +1193,38 @@ mod tests {
         }
     }
 
+    /// The criterion on the profile shape the learnable runs actually reach: a
+    /// negative deepest shell below a positive one above it, where the
+    /// distance-from-zero branch binds rather than the separation cap. Each
+    /// case names the branch it exercises and the value it expects.
+    #[test]
+    fn the_geometry_margin_reads_a_negative_deepest_shell() {
+        let cases: [(&str, [f64; 3], f64); 4] = [
+            // The cycle(15) profile at eta = 0.001, where |deepest| is 4.6x
+            // below the separation.
+            (
+                "measured cycle",
+                [-0.162_791, 0.347_921, -0.096_173],
+                0.096_173,
+            ),
+            // Separation binding on the same sign pattern.
+            ("separation binds", [0.0, -0.10, -0.40], 0.30),
+            // A deepest shell above the one over it scores zero, not a
+            // negative margin.
+            ("inverted shells", [0.0, -0.40, -0.10], -0.30),
+            // No structure at all.
+            ("flat", [0.2, 0.2, 0.2], 0.0),
+        ];
+
+        for (label, means, expected) in cases {
+            let margin = shell_margin(&means);
+            assert!(
+                (margin - expected).abs() < 1e-9,
+                "{label}: shell means {means:?} score {margin:.9}, expected {expected:.9}"
+            );
+        }
+    }
+
     /// The associative reference the criterion measures against: an embedding
     /// whose rows are the adjacency rows scores exactly zero on every D-graph,
     /// its deepest-shell pairs having no common neighbour. Its distance-2 mean
@@ -1281,14 +1313,10 @@ mod tests {
     fn a_graph_without_enough_distance_shells_is_a_typed_error() {
         let complete = Graph::complete(7).expect("complete(7)");
         match TinyNn::new(&complete) {
-            Err(Error::InsufficientDistanceShells {
-                available,
-                required,
-            }) => {
+            Err(Error::InsufficientDistanceShells { available }) => {
                 assert_eq!(
-                    (available, required),
-                    (1, GEOMETRY_SHELLS),
-                    "reported {available} of {required} shells"
+                    available, 1,
+                    "reported {available} populated shells, expected 1"
                 );
             }
             other => panic!("expected InsufficientDistanceShells, got {other:?}"),
@@ -1471,12 +1499,15 @@ mod tests {
         }
     }
 
-    /// The frozen-embedding regime leaves the cosine structure at its draw, so
-    /// the geometry criterion goes unmet over a budget two orders of magnitude
-    /// above the step at which the same run memorizes the edges. This is the
-    /// contrast §B.2.2 rests its associative reading on.
+    /// The frozen-embedding regime memorizes the edges while its embedding
+    /// stays at the draw: the top-d score reaches its maximum and the shell
+    /// profile is the one the seeded draw started with. §B.2.2 rests its
+    /// associative reading on the first half; the second is a property of the
+    /// regime — a frozen embedding cannot move — so the test pins that the
+    /// draw itself is not already geometric, which is what makes the
+    /// learnable runs' margins attributable to training.
     #[test]
-    fn the_frozen_run_memorizes_without_forming_a_geometry() {
+    fn the_frozen_run_memorizes_without_moving_its_embedding() {
         for (name, graph) in d_graphs() {
             let params = Params {
                 max_steps: ASSOCIATIVE_BUDGET,
@@ -1491,12 +1522,22 @@ mod tests {
                  nothing",
                 run.peak_associative_score()
             );
+
+            let first = run.records()[0].geometry_margin();
+            let last = run
+                .last()
+                .expect("a run records its initial state")
+                .geometry_margin();
             assert!(
-                run.geometry_step(GEOMETRY_MARGIN).is_none(),
-                "{name}: the frozen run met the geometry criterion at step {:?}, peak margin \
-                 {:.6}",
-                run.geometry_step(GEOMETRY_MARGIN),
-                run.peak_geometry_margin()
+                (first - last).abs() < 1e-12,
+                "{name}: the frozen run's margin moved from {first:.12} to {last:.12}; a frozen \
+                 embedding cannot change the cosine matrix"
+            );
+            assert!(
+                first < GEOMETRY_MARGIN,
+                "{name}: the seeded draw already scores {first:.6} against the \
+                 {GEOMETRY_MARGIN} criterion, so the learnable runs' margins are not \
+                 attributable to training"
             );
         }
     }

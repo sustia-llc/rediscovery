@@ -52,9 +52,6 @@ pub enum Error {
     #[error("embedding dimension must be at least 1, got {dimension}")]
     InvalidDimension { dimension: usize },
 
-    #[error("a {rows}×{columns} embedding is beyond the representable range")]
-    EmbeddingTooLarge { rows: usize, columns: usize },
-
     #[error("embedding has {rows} rows but the graph has {order} vertices")]
     EmbeddingOrderMismatch { rows: usize, order: usize },
 
@@ -77,8 +74,8 @@ pub enum Error {
         width: usize,
     },
 
-    #[error("graph has vertex pairs at {available} distinct distances, {required} required")]
-    InsufficientDistanceShells { available: usize, required: usize },
+    #[error("graph has vertex pairs at only {available} of the required distinct distances")]
+    InsufficientDistanceShells { available: usize },
 }
 
 /// Crate-wide result alias over [`Error`].

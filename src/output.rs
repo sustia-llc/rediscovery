@@ -1,8 +1,8 @@
 //! CSV output shared by the tier modules.
 //!
-//! [`write_matrix_csv`] writes a dense matrix as one row per matrix row. Tier
-//! 1's weight-untied cosine dumps and Tier 2's cosine and adjacency heatmaps
-//! both go through it, so the layout has one source.
+//! [`write_matrix_csv`] writes a dense matrix as a `row` header followed by
+//! one line per matrix row. Tier 1's weight-untied cosine dumps and Tier 2's
+//! cosine and adjacency heatmaps both call it.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};

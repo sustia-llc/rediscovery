@@ -142,18 +142,10 @@ impl Node2Vec {
     ///
     /// # Errors
     ///
-    /// Propagates [`Params::validate`]'s errors and returns
-    /// [`Error::EmbeddingTooLarge`] when `order * dimension` overflows
-    /// `usize`.
+    /// Propagates [`Params::validate`]'s errors and [`gaussian_matrix`]'s
+    /// [`Error::MatrixTooLarge`] when `order * dimension` overflows `usize`.
     pub fn initial_embedding(&self, params: &Params, seed: u64) -> Result<DMatrix<f64>> {
         params.validate()?;
-        self.order
-            .checked_mul(params.dimension)
-            .ok_or(Error::EmbeddingTooLarge {
-                rows: self.order,
-                columns: params.dimension,
-            })?;
-
         gaussian_matrix(self.order, params.dimension, params.sigma, seed)
     }
 

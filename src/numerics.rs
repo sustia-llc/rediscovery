@@ -4,8 +4,7 @@
 //! [`row_softmax`] and [`log_sum_exp`] carry the row-maximum shift the softmax
 //! paths use, and [`weighted_log_likelihood`] evaluates
 //! Σ_ij W_ij (Z_ij − log Σ_k exp Z_ik) for a weight matrix and a matrix of
-//! logits. `node2vec` (Tier 1) and `tinynn` (Tier 2) share these, so each of
-//! the four formulas has one source.
+//! logits. `node2vec` (Tier 1) and `tinynn` (Tier 2) both call these.
 
 #![allow(
     clippy::doc_markdown,

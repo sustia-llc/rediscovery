@@ -306,18 +306,41 @@ fn the_associative_fit_outruns_the_geometry_by_fifty_times() {
         )
     });
 
+    // Reported alongside: the same asymmetry inside the one learnable run,
+    // where both events happen under identical parameters.
+    let same_run_associative = geometric.associative_step().unwrap_or_else(|| {
+        panic!(
+            "cycle(15): the learnable run never memorized the edges in {GEOMETRIC_BUDGET} \
+             steps; its top-d score peaked at {:.6}",
+            geometric.peak_associative_score()
+        )
+    });
+
     #[allow(
         clippy::cast_precision_loss,
         reason = "step counts here are below 2^53 and exact in f64"
     )]
     let ratio = geometric_step as f64 / associative_step as f64;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "step counts here are below 2^53 and exact in f64"
+    )]
+    let same_run_ratio = geometric_step as f64 / same_run_associative as f64;
     println!(
-        "cycle(15): associative step {associative_step}, geometry step {geometric_step} \
-         (peak margin {:.6}, {:?}), ratio {ratio:.1}",
+        "cycle(15): frozen associative step {associative_step}, geometry step {geometric_step} \
+         (peak margin {:.6}, {:?}), ratio {ratio:.1}; within the learnable run alone, \
+         memorization at step {same_run_associative} gives {same_run_ratio:.1}",
         geometric.peak_geometry_margin(),
         started.elapsed()
     );
 
+    // The denominator is bounded by Refutation 3c's own claim rather than by
+    // whatever the frozen run happened to reach, so the ratio below cannot
+    // become the geometry step alone through an incidental step of 1.
+    assert!(
+        associative_step <= 2,
+        "cycle(15): the frozen run memorized at step {associative_step}, above Refutation 3c's 2"
+    );
     assert!(
         ratio >= TIMING_RATIO,
         "cycle(15): the geometry criterion is met at step {geometric_step} against the \
