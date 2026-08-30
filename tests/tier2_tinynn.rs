@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rediscovery::graph::Graph;
 use rediscovery::node2vec::Outcome;
 use rediscovery::subsystems::runner::Runner;
-use rediscovery::tinynn::{self, GEOMETRY_MARGIN, GEOMETRY_SHELLS, Outputs, Params, Regime, Run};
+use rediscovery::tinynn::{self, FIEDLER_ALIGNMENT, Outputs, Params, Regime, Run, TinyNn};
 
 /// Upper bound on awaits a cancellation regression could hang; the passing
 /// paths resolve well inside it.
@@ -30,13 +30,18 @@ const ASSOCIATIVE_BUDGET: usize = 10;
 /// Steps within which Refutation 3c (md 266) puts the associative fit.
 const ASSOCIATIVE_LIMIT: usize = 2;
 
-/// Applied updates the learnable-embedding run of the ratio pin is allowed,
-/// above the step at which the criterion is met on the 15-cycle at η = 0.001.
-const GEOMETRIC_BUDGET: usize = 1_200;
+/// Learning rates decision D10 sweeps, with the applied-update budget each
+/// gets: the budget of `tinynn`'s own sweep at that rate.
+const GEOMETRIC_SWEEP: [(f64, usize); 3] = [(0.001, 1_200), (0.01, 200), (0.1, 50)];
 
-/// Ratio of geometric to associative steps decision D10 pins, in place of the
-/// paper's own inconsistent 100 (md 256) and ~200 (md 302).
-const TIMING_RATIO: f64 = 50.0;
+/// Seeds the timing pin measures over.
+const TIMING_SEEDS: [u64; 2] = [SEED, 42];
+
+/// Multiple of the memorization step the geometry criterion is pinned to
+/// outrun. Over the four D-graphs, η ∈ {0.001, 0.01, 0.1} and the seeds of
+/// [`TIMING_SEEDS`] the measured budget-to-memorization ratio runs
+/// 23.5–100.0, its minimum on the path-star at η = 0.001 and seed 42.
+const TIMING_FLOOR: f64 = 10.0;
 
 /// Steps the determinism pin compares, enough for both parameter blocks to
 /// move well away from their draw.
@@ -265,88 +270,82 @@ fn the_same_seed_reproduces_a_trajectory_bit_for_bit() {
     }
 }
 
-/// Refutation 3c's timing asymmetry on the 15-cycle, as the ratio decision D10
-/// pins rather than the paper's own inconsistent step counts: the frozen run
-/// reaches full edge memorization in a small multiple of one step, while the
-/// learnable run at η = 0.001 takes at least [`TIMING_RATIO`] times as many
-/// steps to meet the geometry criterion.
+/// Refutation 3c's timing asymmetry inside one learnable run, so that both
+/// events are read under one regime and one η rather than across the frozen
+/// and learnable ones: the top-d score reaches full edge memorization at a
+/// step the run records, while the Fiedler alignment stays below
+/// [`FIEDLER_ALIGNMENT`] for the whole budget — which is at least
+/// [`TIMING_FLOOR`] times that memorization step. So the geometric emergence
+/// step, if the criterion is ever met, is above [`TIMING_FLOOR`] times the
+/// memorization step; the paper's own 100 (md 256) and ~200 (md 302) are not
+/// separated by this measurement, and no ratio between two observed events is
+/// pinned because only one of the two events occurs.
+///
+/// Measured over the four D-graphs, η ∈ {0.001, 0.01, 0.1} and the seeds of
+/// [`TIMING_SEEDS`]: memorization at steps 1–51, budget-to-memorization
+/// ratios 23.5–100.0, and peak alignments 0.031352–0.499665 against the 0.75
+/// criterion.
 #[test]
-fn the_associative_fit_outruns_the_geometry_by_fifty_times() {
-    let graph = Graph::cycle(15).expect("cycle(15)");
+fn the_associative_fit_completes_while_the_geometry_never_forms() {
+    for seed in TIMING_SEEDS {
+        for (name, graph) in d_graphs() {
+            for (learning_rate, budget) in GEOMETRIC_SWEEP {
+                let params = Params {
+                    learning_rate,
+                    max_steps: budget,
+                    regime: Regime::LearnableEmbedding,
+                    ..Params::default()
+                };
+                let paths = RunPaths::new("timing");
+                let started = Instant::now();
+                let run = run_into(&graph, &params, seed, &paths);
+                let label = format!("{name} at eta = {learning_rate}, seed {seed}");
 
-    let associative_paths = RunPaths::new("ratio-frozen");
-    let associative = run_into(&graph, &frozen_params(), SEED, &associative_paths);
-    let associative_step = associative.associative_step().unwrap_or_else(|| {
-        panic!(
-            "cycle(15): the top-d score never reached 1 in {ASSOCIATIVE_BUDGET} steps; it \
-             peaked at {:.6}",
-            associative.peak_associative_score()
-        )
-    });
-    assert!(
-        associative_step >= 1,
-        "cycle(15): the top-d score was already at its maximum before the first update, so the \
-         ratio below would measure nothing"
-    );
+                let associative_step = run.associative_step().unwrap_or_else(|| {
+                    panic!(
+                        "{label}: the top-d score never reached 1 in {budget} steps; it peaked \
+                         at {:.6}",
+                        run.peak_associative_score()
+                    )
+                });
+                assert!(
+                    associative_step >= 1,
+                    "{label}: the top-d score was already at its maximum before the first \
+                     update, so the ratio below would measure nothing"
+                );
 
-    let geometric_params = Params {
-        learning_rate: 0.001,
-        max_steps: GEOMETRIC_BUDGET,
-        regime: Regime::LearnableEmbedding,
-        ..Params::default()
-    };
-    let geometric_paths = RunPaths::new("ratio-learnable");
-    let started = Instant::now();
-    let geometric = run_into(&graph, &geometric_params, SEED, &geometric_paths);
-    let geometric_step = geometric.geometry_step(GEOMETRY_MARGIN).unwrap_or_else(|| {
-        panic!(
-            "cycle(15): the geometry margin never reached {GEOMETRY_MARGIN} in \
-             {GEOMETRIC_BUDGET} steps; it peaked at {:.6}",
-            geometric.peak_geometry_margin()
-        )
-    });
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "step counts here are below 2^53 and exact in f64"
+                )]
+                let ratio = budget as f64 / associative_step as f64;
+                println!(
+                    "{label}: {:?}, memorization at step {associative_step}, budget {budget} \
+                     (ratio {ratio:.1}), alignment step {:?} (peak {:.6}, initial {:.6}), \
+                     peak shell separation {:.6}",
+                    started.elapsed(),
+                    run.alignment_step(FIEDLER_ALIGNMENT),
+                    run.peak_alignment(),
+                    run.records()[0].fiedler_alignment(),
+                    run.peak_deepest_shell_separation()
+                );
 
-    // Reported alongside: the same asymmetry inside the one learnable run,
-    // where both events happen under identical parameters.
-    let same_run_associative = geometric.associative_step().unwrap_or_else(|| {
-        panic!(
-            "cycle(15): the learnable run never memorized the edges in {GEOMETRIC_BUDGET} \
-             steps; its top-d score peaked at {:.6}",
-            geometric.peak_associative_score()
-        )
-    });
-
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "step counts here are below 2^53 and exact in f64"
-    )]
-    let ratio = geometric_step as f64 / associative_step as f64;
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "step counts here are below 2^53 and exact in f64"
-    )]
-    let same_run_ratio = geometric_step as f64 / same_run_associative as f64;
-    println!(
-        "cycle(15): frozen associative step {associative_step}, geometry step {geometric_step} \
-         (peak margin {:.6}, {:?}), ratio {ratio:.1}; within the learnable run alone, \
-         memorization at step {same_run_associative} gives {same_run_ratio:.1}",
-        geometric.peak_geometry_margin(),
-        started.elapsed()
-    );
-
-    // The denominator is bounded by Refutation 3c's own claim rather than by
-    // whatever the frozen run happened to reach, so the ratio below cannot
-    // become the geometry step alone through an incidental step of 1.
-    assert!(
-        associative_step <= 2,
-        "cycle(15): the frozen run memorized at step {associative_step}, above Refutation 3c's 2"
-    );
-    assert!(
-        ratio >= TIMING_RATIO,
-        "cycle(15): the geometry criterion is met at step {geometric_step} against the \
-         associative step {associative_step}, a ratio of {ratio:.1} below the pinned \
-         {TIMING_RATIO}"
-    );
+                let peak = run.peak_alignment();
+                assert!(
+                    peak < FIEDLER_ALIGNMENT,
+                    "{label}: the Fiedler alignment peaked at {peak:.6} over {budget} steps, \
+                     reaching the {FIEDLER_ALIGNMENT} criterion at step {:?}",
+                    run.alignment_step(FIEDLER_ALIGNMENT)
+                );
+                assert!(
+                    ratio >= TIMING_FLOOR,
+                    "{label}: the budget {budget} is only {ratio:.1} times the memorization \
+                     step {associative_step}, below the pinned {TIMING_FLOOR}, so the null \
+                     above bounds the geometry step by less than that factor"
+                );
+            }
+        }
+    }
 }
 
 /// A `Runner`-driven run stops mid-sweep when its child token is cancelled and
@@ -408,7 +407,10 @@ async fn a_cancelled_run_stops_and_leaves_a_well_formed_csv() {
     );
 
     let rows = read_rows(paths.history.path());
-    let expected_fields = 5 + GEOMETRY_SHELLS;
+    let shells = TinyNn::new(&Graph::cycle(15).expect("cycle(15)"))
+        .expect("TinyNn::new")
+        .shell_count();
+    let expected_fields = 6 + shells;
     assert_eq!(
         rows.len(),
         run.records().len() + 1,
