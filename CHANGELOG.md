@@ -11,39 +11,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Tier 2 `TinyNn`: the §B.2.2 model as Z = E W Eᵀ with a tied 512-wide
   embedding and one trainable weight matrix, in frozen-E and learnable-E
-  regimes over the same degree-normalized cross-entropy Tier 1 uses. Hand-derived gradients FD-checked per parameter
-  block, a GELU variant, per-step CSV instrumentation, cosine and adjacency
-  heatmaps, and `examples/tier2_tinynn.rs`. New `numerics` and `output`
-  modules hold the softmax, log-sum-exp, cross-entropy, seeded Gaussian draw
-  and matrix-CSV writer that Tiers 1 and 2 share.
+  regimes over the same degree-normalized cross-entropy Tier 1 uses.
+  Hand-derived gradients FD-checked per parameter block, a GELU variant,
+  per-step CSV instrumentation, cosine and adjacency heatmaps, and
+  `examples/tier2_tinynn.rs`. Two measures: `fiedler_alignment` (the
+  spectral criterion) and `deepest_shell_separation` over the full graph
+  diameter (reported, not thresholded). New `numerics` and `output` modules
+  hold the softmax, log-sum-exp, cross-entropy, seeded Gaussian draw and
+  matrix-CSV writer that Tiers 1 and 2 share.
 
 ### Findings (Tier 2)
 
-> **Retraction, 2026-08-29.** An adversarial review of the shell-based
-> geometry criterion found it unsound, and every claim below that used the
-> word "geometry" is withdrawn pending the replacement measure. What the
-> criterion actually scores is the deepest read shell's mean cosine, and it
-> reads only shells 2 and 3. Measured: a cosine matrix with neighbours
-> near-antipodal (d1 = −0.9, d2 = +0.6, d3 = +0.2) scores 0.200 and passes on
-> all four graphs; a near-collapsed cone (d1 = d2 = 0.95, d3 = 0.80) scores
-> 0.150 and passes. Raising the read depth to four shells makes the same runs
-> fail (path-star peaks at −0.000439 over 1200 steps). Worse, the certified
-> embeddings load on the **bottom** of the spectrum — top singular direction
-> at eigenvector index 16/15/14 of −L with Fiedler-mass **0.00**, against
-> Node2Vec's 0.98–1.00 on the same graphs — so the quantity measured is not
-> the spectral geometry §4.1 describes. The 0.05 threshold also rejects the
-> paper's own reference geometry on the path-star (0.0313) while accepting a
-> rank-1 embedding on the grid and cycle.
+> **History.** The first Tier-2 geometry measure was a shell-based cosine
+> criterion. An adversarial review found it unsound — it read only shells 2
+> and 3, certified a cosine matrix whose neighbours were near-antipodal
+> (score 0.200), and its certified embeddings loaded on the **bottom** of the
+> spectrum (Fiedler-mass 0.00). Those claims were retracted and the measure
+> replaced by the spectral one below, under which the geometric result
+> reverses. The shell profile survives as a reported instrument, not a
+> criterion.
 
+- **Under a spectral measure calibrated so the paper's own references pass,
+  no TinyNN run forms the geometry.** `fiedler_alignment` deflates one
+  eigenvector of −L per connected component and averages the squared
+  Fiedler-eigenspace projection of the leading principal directions of the
+  remainder. Calibration on all four graphs: the Laplacian Fiedler
+  eigenvectors score **1.000000** and Tier-1 Node2Vec **0.980–1.000**, while a
+  rank-1 Fiedler-sign embedding scores 0.289–0.409, all-rows-identical
+  0.000–0.031, and 200 Gaussian draws peak at 0.380–0.491 — a clean gap, with
+  the 0.75 threshold inside it. Against that scale the learnable TinyNN runs
+  peak at **0.031–0.513** and the alignment step is `None` in all 24 runs
+  (four graphs × three rates × two seeds) and all 12 example runs. The
+  architecture memorizes the edges and does not develop the spectral geometry
+  §4.1 describes, which is a non-reproduction of the geometric half of
+  Refutation 3b/3c under our knob choices.
 - **Refutation 3c's associative half reproduces.** The frozen regime reaches
   its maximum top-d(u) neighbour score at **step 1** on all four graphs and
   both seeds, inside the paper's two steps. Initial scores 0.089–0.221 and
   0.078–0.167; correlation between the model's distribution and D⁻¹A is
-  0.974–0.981 at the hit step. The timing *ratio* against the geometric side
-  is withdrawn with the criterion, and the pin that carried it mixed regimes
-  and rates: at matched η within one learnable run the largest ratio measured
-  is **49.5** (cycle, η = 0.001), below the 50 it asserted, and 13.6 at
-  seed 42.
+  0.974–0.981 at the hit step. Memorization steps in the learnable regime run
+  1–51 across the sweep. No timing *ratio* is claimed: only one of the two
+  events occurs, so the pin asserts the memorization step, the alignment null,
+  and a budget floor of 10× the memorization step against a measured minimum
+  of 23.5.
 - **The ≤2-step result depends on an initializer the paper does not state.**
   Measured across a σ grid: at `weight_sigma = 1/√m` it takes 4–10 steps
   (seed-dependent); at the PyTorch `nn.Linear` default it fails on three of
@@ -61,7 +71,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   §B.3 instead specifies AdamW with weight decay and a cosine schedule; the
   implementation follows the captions. The η = 0.1 embedding is not
   degenerate (numeric rank = n, effective rank 9.9–12.3, row-norm spread
-  ≤ 1.34). This finding survives the retraction because it rests on the
+  ≤ 1.34). Restated under the spectral measure: η = 0.1 gives the highest
+  peak alignment on three of four graphs in the 2000-step sweep, and is 0.019
+  below η = 0.01 on the cycle — so it is not the rate that fails to form
+  structure. This finding survived the retraction: it rests on the
   trajectory, not on the criterion.
 - **Figure 23's "gradual decrease in similarity" does not hold for this
   architecture, and the deviation is larger than first reported.** Over the
@@ -70,11 +83,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   −0.136), not a decay. Node2Vec on the same graphs is monotone throughout
   (cycle +0.962 → +0.121 across d1..d7), which is the contrast the paper
   draws.
-- **A diverged run could report a geometry.** At η = 10 the irregular graph
-  scored 0.098 at loss 9.99e27, cosines being scale-invariant; once the
-  embedding is wholly non-finite the score is 0.0000 rather than NaN. No
-  reported number is affected (all swept rates stay finite, final losses
-  10.18–20.57), but the measure needs a finiteness guard.
+- **A diverged run could report a geometry** under the retracted measure: at
+  η = 10 the irregular graph scored 0.098 at loss 9.99e27, cosines being
+  scale-invariant. Both instruments now reject a non-finite embedding — the
+  shell profile returns NaN and `fiedler_alignment` returns
+  `Error::NonFinite`. A diverged-but-finite run can still score, which the
+  scale-invariance the measure needs makes unavoidable.
 
 ### Added
 
