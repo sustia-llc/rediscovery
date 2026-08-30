@@ -39,6 +39,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The W-initialization flip demonstration (#5): `examples/w_init_flip.rs` —
+  two runs differing only in W(0), the identity run verified bit-identical
+  to the committed transition sweep (all ten recorded steps; crossing at
+  step 9, final alignment 0.7569668681021637) — and `examples/w_init_flip.py`,
+  an independent stdlib-plus-numpy reimplementation with the Rust crate as
+  the pinned reference: `fiedler_alignment` agrees to 9.4e-16 on shared
+  deterministic inputs, one gradient step agrees to 2.1e-17 entrywise, and
+  the flip reproduces at four numpy seeds (identity crossing at steps 9–15,
+  Gaussian peaks 0.100–0.501, all below the criterion).
+- The MIT license and a rewritten public-facing README, ahead of the
+  repository going public.
 - The issue-#5 transition machinery (#5): additive `Params` fields —
   `weight_init` (identity or the committed Gaussian), `weight_rate_ratio`
   (ρ = η_W/η_E), an `optimizer` carrying a hand-rolled decoupled AdamW with
