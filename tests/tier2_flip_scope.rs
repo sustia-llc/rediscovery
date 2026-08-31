@@ -1,15 +1,14 @@
-//! Scope pin for the W-initialization flip: the dichotomy is
-//! graph-dependent.
+//! Scope pins for the W-initialization flip beyond the D-graphs.
 //!
-//! The committed Tier-2 finding — no Gaussian-initialized learnable run
-//! crosses the 0.75 criterion in 20 000 steps at any ρ — was measured on
-//! the four D-graphs, `grid(4, 4)` among them. It does not extend
-//! unmodified to larger members of the same family: on `grid(6, 8)` at
-//! the committed width, η = 0.01 and ρ = 1, the Gaussian-initialized run
-//! crosses the criterion (measured peak alignment 0.8160584913387996 at
-//! seed 20260829 over a 2 000-step budget). First observed downstream in
-//! `spatial-priors` (finding F15, 2026-08-31); reproduced here with this
-//! crate's own run loop.
+//! The committed Tier-2 finding — no Gaussian-initialized learnable run on
+//! the four D-graphs crosses the 0.75 criterion in 20 000 steps at any ρ —
+//! does not fix the behavior of other graphs. On `grid(6, 8)` at the
+//! committed knobs the outcome differs by seed: at seed 20260829 the
+//! Gaussian run crosses the criterion at step 77, while at seed 42 it stays
+//! below the criterion for a whole 2 000-step budget (measured peak
+//! 0.004342691178681286). Both behaviors are pinned here, so the boundary
+//! claim ranges over exactly the graph and the two seeds the assertions
+//! touch.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,7 +17,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 
 use rediscovery::graph::Graph;
-use rediscovery::tinynn::{self, FIEDLER_ALIGNMENT, Outputs, Params, Regime, WeightInit};
+use rediscovery::tinynn::{
+    self, FIEDLER_ALIGNMENT, Outputs, Params, Regime, StopReason, WeightInit,
+};
+
+/// Rows of the grid this scope pin measures.
+const GRID_ROWS: usize = 6;
+
+/// Columns of the grid this scope pin measures.
+const GRID_COLS: usize = 8;
+
+/// The step at which the seed-20260829 Gaussian run first meets the
+/// criterion under the committed sweep knobs.
+const CROSSING_STEP: usize = 77;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -49,34 +60,84 @@ impl Drop for TempPath {
     }
 }
 
-/// On the 6×8 grid the Gaussian-initialized learnable run crosses the
-/// geometry criterion — the initialization dichotomy of the committed
-/// D-graph finding does not extend to every graph, or even to every grid.
-#[test]
-fn the_gaussian_run_crosses_the_criterion_on_the_6x8_grid() -> Result<()> {
-    let graph = Graph::grid(6, 8)?;
-    let params = Params {
+/// The committed transition-sweep Gaussian-arm parameters, on the grid this
+/// file measures: width 512, η = 0.01, ρ = 1, geometry stop at the
+/// criterion, 20 000-step budget.
+fn sweep_params() -> Params {
+    Params {
         learning_rate: 0.01,
-        max_steps: 2_000,
+        max_steps: 20_000,
         regime: Regime::LearnableEmbedding,
         weight_init: WeightInit::Gaussian,
         weight_rate_ratio: 1.0,
-        alignment_stop: None,
+        alignment_stop: Some(FIEDLER_ALIGNMENT),
         ..Params::default()
-    };
+    }
+}
+
+/// Runs `params` on the pinned grid at `seed` into temp paths.
+fn run_on_grid(params: &Params, seed: u64) -> Result<tinynn::Run> {
+    let graph = Graph::grid(GRID_ROWS, GRID_COLS)?;
     let history = TempPath::new("history");
     let cosines = TempPath::new("cosines");
     let outputs = Outputs {
         history: history.path(),
         cosines: cosines.path(),
     };
+    Ok(tinynn::run(&graph, params, seed, &outputs, || false)?)
+}
 
-    let run = tinynn::run(&graph, &params, 20_260_829, &outputs, || false)?;
+/// At seed 20260829 the Gaussian-initialized run on the 6×8 grid meets the
+/// criterion at step 77 under the committed sweep knobs — the behavior no
+/// D-graph Gaussian run shows at either committed seed.
+#[test]
+fn the_gaussian_run_crosses_on_the_grid_at_the_first_committed_seed() -> Result<()> {
+    let run = run_on_grid(&sweep_params(), 20_260_829)?;
 
+    assert_eq!(
+        run.stop_reason(),
+        StopReason::Aligned,
+        "the grid({GRID_ROWS}, {GRID_COLS}) Gaussian run at seed 20260829 ended on {:?} after \
+         {} steps, expected the geometry stop",
+        run.stop_reason(),
+        run.steps()
+    );
+    assert_eq!(
+        run.alignment_step(FIEDLER_ALIGNMENT),
+        Some(CROSSING_STEP),
+        "the grid({GRID_ROWS}, {GRID_COLS}) Gaussian run at seed 20260829 met the criterion at \
+         step {:?}, expected {CROSSING_STEP}",
+        run.alignment_step(FIEDLER_ALIGNMENT)
+    );
+    Ok(())
+}
+
+/// At seed 42 the same configuration stays below the criterion for a whole
+/// 2 000-step budget, so the grid's crossing is a property of the seed as
+/// well as the graph.
+#[test]
+fn the_gaussian_run_stays_below_the_criterion_on_the_grid_at_the_second_seed() -> Result<()> {
+    let params = Params {
+        alignment_stop: None,
+        max_steps: 2_000,
+        ..sweep_params()
+    };
+    let run = run_on_grid(&params, 42)?;
+
+    assert_eq!(
+        run.alignment_step(FIEDLER_ALIGNMENT),
+        None,
+        "the grid({GRID_ROWS}, {GRID_COLS}) Gaussian run at seed 42 met the criterion at step \
+         {:?} inside the {} recorded steps",
+        run.alignment_step(FIEDLER_ALIGNMENT),
+        run.steps()
+    );
     assert!(
-        run.peak_alignment() >= FIEDLER_ALIGNMENT,
-        "the Gaussian run crosses on grid(6, 8): measured peak 0.8160584913387996, got {}",
-        run.peak_alignment()
+        run.peak_alignment() < FIEDLER_ALIGNMENT,
+        "the grid({GRID_ROWS}, {GRID_COLS}) Gaussian run at seed 42 peaked at {} over {} steps, \
+         at or above the {FIEDLER_ALIGNMENT} criterion",
+        run.peak_alignment(),
+        run.steps()
     );
     Ok(())
 }

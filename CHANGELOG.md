@@ -9,19 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Findings (Tier 2)
 
-- **The W-initialization flip is graph-dependent.** The committed finding
-  — no Gaussian-initialized learnable run crosses the 0.75 criterion in
-  20 000 steps at any ρ — holds on the four D-graphs, `grid(4, 4)` among
-  them, and does not extend unmodified to larger members of the same
-  family: on `grid(6, 8)` at the committed width 512, η = 0.01, ρ = 1,
-  seed 20260829, the Gaussian-initialized run peaks at alignment
-  **0.8160584913387996** within a 2 000-step budget — above the
-  criterion. First observed downstream in
-  [`spatial-priors`](https://github.com/sustia-llc/spatial-priors)
-  (finding F15, 2026-08-31); reproduced with this crate's own run loop
-  and pinned in `tests/tier2_flip_scope.rs`. The initializer decides the
-  geometry on the committed graphs; which graphs the dichotomy covers is
-  its own open question.
+- **The Gaussian-initializer null is scoped to the D-graphs; beyond them
+  the boundary is jointly graph- and seed-dependent.** The committed
+  finding — no Gaussian-initialized learnable run crosses the 0.75
+  criterion in 20 000 steps at any ρ — holds on the four D-graphs at both
+  committed seeds. On `grid(6, 8)` at the committed knobs (width 512,
+  η = 0.01, ρ = 1, geometry stop at the criterion, 20 000-step budget) the
+  outcome splits by seed: at 20260829 the Gaussian run **crosses at
+  step 77**, and run past the stop to a 2 000-step budget it peaks at
+  alignment **0.8160584913387996**; at seed 42 it does not cross — peak
+  0.004342691178681286 within 2 000 steps, and none within 20 000 (that
+  deeper budget measured in the PR #9 review, recorded on the PR). Both
+  grid behaviors are pinned in `tests/tier2_flip_scope.rs`. First observed
+  downstream in spatial-priors (finding F15); which graphs and seeds the
+  dichotomy covers is its own open question.
 
 ## [0.1.0] - 2026-08-31
 
