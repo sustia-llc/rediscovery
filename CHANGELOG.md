@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Findings (Tier 2)
 
+- **Crossing is not retention (#12).** Identity-initialized runs continued
+  past their crossing with no geometry stop (20,000-step budget, committed
+  knobs, both seeds) split three ways: `cycle(15)` converges — still
+  climbing at the budget's end, alignment ≈ 1.0 at both seeds;
+  `grid(4, 4)` retains — 0.844/0.876 at 20,000, above the criterion;
+  `path_star(4, 4)` and `irregular()` decay — peaks ≈ 0.99 (at steps
+  44–506 across the four runs) fall to 0.647/0.648 and 0.619/0.703 at
+  20,000, below the criterion, at both seeds. The probe reproduced the committed crossing
+  steps f64-exactly, 8/8; the full table is on issue #12;
+  `tests/tier2_retention.rs` pins the path-star decay (crossing at
+  step 11, peak above 0.99, below the criterion at step 1000). The
+  retention classes track the Tier-1 split: the circulant that satisfied
+  Observation 8 converges, and the graphs where the Tier-1 coefficient
+  norm plateaued shed the geometry (#8). First reported downstream on
+  `grid(4, 5)` (spatial-priors F8), reproduced here at 0.9978/0.7056
+  against their ≈0.998/≈0.705.
 - **The Gaussian-initializer null is scoped to the D-graphs; beyond them
   the boundary is jointly graph- and seed-dependent.** The committed
   finding — no Gaussian-initialized learnable run crosses the 0.75

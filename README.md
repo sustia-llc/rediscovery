@@ -23,7 +23,10 @@ geometries pass (Laplacian Fiedler eigenvectors 1.0, Node2Vec 0.98–1.00;
 threshold 0.75), **the TinyNN's spectral geometry is decided by its hidden
 layer's initialization, not by its trainability and not by the optimizer**:
 with W(0) = I every learnable run crosses the criterion within 7–35 full-batch
-steps — even with W training freely — while with W(0) ~ N(0, 1/m) no run on
+steps — even with W training freely — though crossing is not retention: run
+past the crossing, the cycle converges toward 1.0, the grid retains, and the
+path-star and irregular graphs decay back below the criterion (see Findings).
+With W(0) ~ N(0, 1/m) no run on
 the four D-graphs crosses it in 20,000 steps at any relative weight rate, nor
 under §B.3's AdamW-with-schedule; those runs memorize the edges instead.
 §B.2.2 does not state the paper's initializer. Beyond the D-graphs the
