@@ -269,6 +269,25 @@ impl Graph {
     pub fn degrees(&self) -> &DVector<f64> {
         &self.degrees
     }
+
+    /// The vertices adjacent to `vertex`, in ascending order — the
+    /// adjacency row as indices, for consumers that walk the graph rather
+    /// than multiply by it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::VertexOutOfBounds`] when `vertex` is not a vertex.
+    pub fn neighbors(&self, vertex: usize) -> Result<Vec<usize>> {
+        if vertex >= self.order() {
+            return Err(Error::VertexOutOfBounds {
+                vertex,
+                order: self.order(),
+            });
+        }
+        Ok((0..self.order())
+            .filter(|&other| self.adjacency[(vertex, other)] > 0.0)
+            .collect())
+    }
 }
 
 /// Rejects `value` below `minimum`, naming `parameter` in the error.
@@ -321,6 +340,38 @@ pub(crate) fn test_fixtures() -> Vec<(&'static str, Graph)> {
 )]
 mod tests {
     use super::*;
+
+    /// `neighbors` lists each vertex's adjacent indices in ascending
+    /// order: pinned by hand on known rows, by the degree count on every
+    /// fixture, and rejected out of range.
+    #[test]
+    fn neighbors_list_the_adjacency_row_ascending() {
+        let cycle = Graph::cycle(15).expect("cycle(15)");
+        assert_eq!(cycle.neighbors(0).expect("vertex 0"), vec![1, 14]);
+        let grid = Graph::grid(4, 4).expect("grid(4,4)");
+        assert_eq!(grid.neighbors(0).expect("vertex 0"), vec![1, 4]);
+        let irregular = Graph::irregular().expect("irregular()");
+        assert_eq!(irregular.neighbors(0).expect("vertex 0"), vec![1, 2, 10]);
+
+        for (label, graph) in test_fixtures() {
+            for vertex in 0..graph.order() {
+                let neighbors = graph.neighbors(vertex).expect("in-range vertex");
+                assert_eq!(
+                    neighbors.len() as f64,
+                    graph.degrees()[vertex],
+                    "{label}, vertex {vertex}: the neighbor count is the degree"
+                );
+            }
+        }
+
+        assert!(matches!(
+            cycle.neighbors(15),
+            Err(Error::VertexOutOfBounds {
+                vertex: 15,
+                order: 15
+            })
+        ));
+    }
 
     /// D1–D4 vertex counts, plus the edge count each topology implies.
     #[test]
