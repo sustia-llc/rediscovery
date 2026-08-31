@@ -35,6 +35,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and adjacency membership over all 92 fixture rows, the degree count on
   every fixture, the empty row, and the out-of-range rejection with its
   payload.
+- `examples/tier1_circulance.rs` (#8): the Observation-8 sweep over graph
+  classes — fifteen graphs across three construction classes (eight
+  circulants built as C_n(offsets), the Petersen and Frucht graphs, a
+  chorded cycle, a path, and the three committed baselines) at both
+  committed seeds, weight-tied at the Fig-9 knobs, recording each run's
+  outcome, final Observation-8 residual, and the #7 Rayleigh/rotation
+  split on the Fiedler-like set, with an identity-initialized retention
+  arm on the twelve graphs the committed record does not carry. The
+  circulant builder is checked against `Graph::cycle(15)` entry for
+  entry at startup and the Petersen/Frucht constructions are degree- and
+  edge-count-checked; their symmetry classifications are
+  literature-cited, not measured.
 
 ### Findings (Tier 1)
 
@@ -48,6 +60,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.1.0 sentence's 4.8e-15, and the 99.6 % rotation share behind
   Proposition 7's failure, are both located by the split's measured
   tables, recorded on issue #7 at the landing.
+- **Circulance is not the predicate behind Observation 8 (#8).** The
+  Petersen graph — vertex-transitive, not circulant — converges with
+  final residual 4.270e-6/4.297e-6 (seeds 42/20260829), the committed
+  cycle's own converged scale, while the five graphs in the sweep that
+  are not vertex-transitive — the Frucht graph (0.1597 at both seeds),
+  the chorded cycle (0.193–0.195), path(15) (0.49–0.52), grid
+  (0.246–0.252), irregular (0.200–0.223) — sit four to five orders
+  above it at the 10 000-step budget, flat or rising where sampled
+  while the low-residual class decays. Vertex-transitivity survives as the
+  candidate; normality of D⁻¹A falls with circulance, since the
+  3-regular Frucht graph's D⁻¹A = A/3 is symmetric. The Frucht graph
+  replaces the 0.1.0 bullet's unnamed 3-regular counterexample with a
+  committed construction. Spectral degeneracy alone does not decide the
+  split — grid carries a width-2 degenerate group yet fails at 0.25 —
+  cycle(20) hit the budget still decaying at 1.6e-2, and complete(7) is
+  degenerate as an instrument: its Fiedler-like range is the whole
+  non-trivial spectrum, so the residual compares R⁷ with itself
+  (2.5e-15 is rounding), while under the #7 split C acts on that block
+  as the exact scalar −1/3. Full tables recorded on issue #8.
+- **Correction to a 0.1.0 Findings sentence (budget attribution),
+  measured at the #8 landing:** the "Observation 8 holds only on the
+  circulant graph" bullet attaches the cycle's 4.9e-6 to "at 10 000
+  steps"; that value belongs to the converged step 15 855 of the
+  20 000-step run, as the Figure-9 bullet above it states. Re-running
+  the `cycle_reproduces_the_full_fig9_signature` configuration measured
+  4.922644e-6 at step 15 855 and 1.482136e-4 at step 10 000, the latter
+  bit-matching the #8 sweep's cycle row. The "at 10 000 steps" clause
+  covers the grid/path-star/irregular figures beside it. Recorded on
+  issue #8.
 
 ### Findings (Tier 2)
 
@@ -81,6 +122,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   grid behaviors are pinned in `tests/tier2_flip_scope.rs`. First observed
   downstream in spatial-priors (finding F15); which graphs and seeds the
   dichotomy covers is its own open question.
+- **Retention on the #8 sweep's new graphs: all 22 measurable
+  identity-initialized runs end above the criterion at a 2 000-step
+  budget.** Under the committed identity-arm knobs (ρ = 1, η = 0.01, no
+  geometry stop, both seeds) every measurable new graph crosses 0.75 by
+  step 48 and ends at or above 0.9438; complete(7) cannot run at all —
+  a diameter-1 graph has one distance shell against the metrics' two
+  (`Error::InsufficientDistanceShells`). At a tenth of #12's budget the
+  endpoint separates nothing; the peak step carries what structure there
+  is: the three configurations that peak early and end below their peak
+  (the Frucht graph at steps 524/623, the chorded cycle at 127/159,
+  path(15) at seed 20260829 at step 40) are all Observation-8 failures,
+  while the circulants and Petersen sit at or within 1e-5 of their peak
+  at step 2 000. The correspondence is not clean the other way: path(15)
+  at seed 42, an Observation-8 failure, is still rising at the budget.
+  Full table recorded on issue #8.
 
 ## [0.1.0] - 2026-08-31
 
