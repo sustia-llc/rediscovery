@@ -173,7 +173,7 @@ fn the_history_csv_round_trips_the_in_memory_records() {
         let run = run_into(&graph, &params, 4_242, temp.path());
         let rows = read_rows(temp.path());
         let order = graph.order();
-        let expected_fields = 4 + 2 * order;
+        let expected_fields = 4 + 4 * order;
 
         assert_eq!(
             rows.len(),
@@ -191,6 +191,8 @@ fn the_history_csv_round_trips_the_in_memory_records() {
         ];
         header.extend((0..order).map(|i| format!("projection_{i}")));
         header.extend((0..order).map(|i| format!("coefficient_norm_{i}")));
+        header.extend((0..order).map(|i| format!("rayleigh_{i}")));
+        header.extend((0..order).map(|i| format!("rotation_{i}")));
         assert_eq!(rows[0], header, "{name}: unexpected CSV header");
 
         for (record, row) in run.records().iter().zip(&rows[1..]) {
@@ -241,9 +243,103 @@ fn the_history_csv_round_trips_the_in_memory_records() {
                     value,
                 );
             }
+            for (i, &value) in record.rayleigh().iter().enumerate() {
+                assert_field(
+                    name,
+                    record,
+                    "rayleigh",
+                    parse(row, 4 + 2 * order + i, name),
+                    value,
+                );
+            }
+            for (i, &value) in record.rotations().iter().enumerate() {
+                assert_field(
+                    name,
+                    record,
+                    "rotation",
+                    parse(row, 4 + 3 * order + i, name),
+                    value,
+                );
+            }
         }
     }
 }
+
+/// The split columns carry the orthogonal decomposition through the CSV: over
+/// the four D-graphs at [`trajectory_params`], re-parsed `rayleigh_i` and
+/// `rotation_i` satisfy r_i² + rotation_i² = ‖Ce_i‖₂² against the separately
+/// written `coefficient_norm_i`, every rotation field is non-negative, and the
+/// Rayleigh fields take both signs — a run whose Rayleigh column stayed
+/// one-signed would pass an unsigned reading of that column too.
+#[test]
+fn the_split_columns_reconstruct_the_coefficient_norm_column() {
+    let params = trajectory_params();
+    let mut worst = 0.0_f64;
+    let mut worst_label = String::new();
+    let mut saw_negative = false;
+    let mut saw_positive = false;
+
+    for (name, graph) in d_graphs() {
+        let temp = TempPath::new("split-columns");
+        let run = run_into(&graph, &params, 4_242, temp.path());
+        let rows = read_rows(temp.path());
+        let order = graph.order();
+
+        for (record, row) in run.records().iter().zip(&rows[1..]) {
+            assert_eq!(
+                row.len(),
+                4 + 4 * order,
+                "{name}: row for step {} has {} fields, expected {}",
+                record.step(),
+                row.len(),
+                4 + 4 * order
+            );
+            for i in 0..order {
+                let norm = parse(row, 4 + order + i, name);
+                let rayleigh = parse(row, 4 + 2 * order + i, name);
+                let rotation = parse(row, 4 + 3 * order + i, name);
+                let deviation = (rayleigh * rayleigh + rotation * rotation - norm * norm).abs();
+
+                saw_negative |= rayleigh < 0.0;
+                saw_positive |= rayleigh > 0.0;
+                assert!(
+                    rotation >= 0.0,
+                    "{name}: rotation_{i} at step {} re-parses as {rotation:e}, but it is a norm",
+                    record.step()
+                );
+                if deviation > worst {
+                    worst = deviation;
+                    worst_label = format!("{name} eigenvector {i} at step {}", record.step());
+                }
+                assert!(
+                    deviation < SPLIT_TOLERANCE,
+                    "{name}: at step {} the CSV columns for eigenvector {i} give \
+                     r_i = {rayleigh:.6e}, rotation_i = {rotation:.6e}, ‖Ce_i‖₂ = {norm:.6e}; \
+                     |r_i² + rotation_i² − ‖Ce_i‖₂²| = {deviation:.6e}, tolerance \
+                     {SPLIT_TOLERANCE:e}",
+                    record.step()
+                );
+            }
+        }
+    }
+
+    assert!(
+        saw_negative && saw_positive,
+        "over the four D-graphs the Rayleigh column carried a negative value: {saw_negative}, \
+         a positive value: {saw_positive}; a column that stays one-signed would pass an \
+         unsigned reading of it too"
+    );
+    println!(
+        "the_split_columns_reconstruct_the_coefficient_norm_column: max \
+         |r_i² + rotation_i² − ‖Ce_i‖₂²| = {worst:.6e} at {worst_label}"
+    );
+}
+
+/// Bound on |r_i² + rotation_i² − ‖Ce_i‖₂²| computed from the re-parsed CSV
+/// columns. The measured maximum over the four D-graphs at
+/// [`trajectory_params`], seed 4242, is 2.842e-14, so this leaves a factor of
+/// 35 over f64 rounding at that scale.
+const SPLIT_TOLERANCE: f64 = 1e-12;
 
 /// Field `index` of `row`, parsed as `f64`.
 fn parse(row: &[String], index: usize, name: &str) -> f64 {
@@ -377,7 +473,7 @@ async fn a_cancelled_run_stops_and_leaves_a_well_formed_csv() {
     );
 
     let rows = read_rows(temp.path());
-    let expected_fields = 4 + 2 * 15;
+    let expected_fields = 4 + 4 * 15;
     assert_eq!(
         rows.len(),
         run.records().len() + 1,

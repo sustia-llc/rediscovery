@@ -362,10 +362,42 @@ fn eigenvector_projections(spectrum: &Spectrum, embedding: &DMatrix<f64>) -> Vec
         .collect()
 }
 
-/// ‖Ce_i‖₂ for every eigenvector column of `spectrum`.
-fn coefficient_norms(spectrum: &Spectrum, coefficient: &DMatrix<f64>) -> Vec<f64> {
+/// C's action on one eigenvector basis, entry i describing Ce_i.
+struct CoefficientAction {
+    /// ‖Ce_i‖₂.
+    norms: Vec<f64>,
+    /// The signed Rayleigh component r_i = e_iᵀCe_i along e_i.
+    rayleigh: Vec<f64>,
+    /// The rotation component ‖Ce_i − r_i e_i‖₂ perpendicular to e_i.
+    rotations: Vec<f64>,
+}
+
+/// Splits C's action on every eigenvector column of `spectrum` into ‖Ce_i‖₂,
+/// the signed Rayleigh component r_i = e_iᵀCe_i along e_i, and the rotation
+/// component ‖Ce_i − r_i e_i‖₂ perpendicular to it.
+///
+/// The eigenvectors are orthonormal, so the two components are the legs of a
+/// right triangle with hypotenuse ‖Ce_i‖₂. The rotation is the residual norm
+/// ‖Ce_i − r_i e_i‖₂, not `(‖Ce_i‖₂² − r_i²)^{1/2}`.
+fn coefficient_action(spectrum: &Spectrum, coefficient: &DMatrix<f64>) -> CoefficientAction {
     let applied = coefficient * spectrum.eigenvectors();
-    applied.column_iter().map(|column| column.norm()).collect()
+    let mut norms = Vec::with_capacity(applied.ncols());
+    let mut rayleigh = Vec::with_capacity(applied.ncols());
+    let mut rotations = Vec::with_capacity(applied.ncols());
+    for (image, vector) in applied
+        .column_iter()
+        .zip(spectrum.eigenvectors().column_iter())
+    {
+        let component = vector.dot(&image);
+        norms.push(image.norm());
+        rayleigh.push(component);
+        rotations.push((image - vector * component).norm());
+    }
+    CoefficientAction {
+        norms,
+        rayleigh,
+        rotations,
+    }
 }
 
 /// The Observation-8 residual ‖Q_v − Q_p Q_pᵀ Q_v‖_F between the top-`k`
@@ -396,6 +428,8 @@ pub struct StepRecord {
     observation8_residual: f64,
     projections: Vec<f64>,
     coefficient_norms: Vec<f64>,
+    rayleigh: Vec<f64>,
+    rotations: Vec<f64>,
 }
 
 impl StepRecord {
@@ -434,6 +468,24 @@ impl StepRecord {
     #[must_use]
     pub fn coefficient_norms(&self) -> &[f64] {
         &self.coefficient_norms
+    }
+
+    /// The signed Rayleigh component r_i = e_iᵀCe_i of Ce_i along e_i, for
+    /// every eigenvector of −L. It is C's eigenvalue along e_i whenever e_i is
+    /// an eigenvector of C, and [`StepRecord::rotations`] measures how far
+    /// from that C is.
+    #[must_use]
+    pub fn rayleigh(&self) -> &[f64] {
+        &self.rayleigh
+    }
+
+    /// The rotation component ‖Ce_i − r_i e_i‖₂ of Ce_i perpendicular to e_i,
+    /// for every eigenvector of −L. It is zero to rounding exactly when e_i
+    /// is an eigenvector of C, and together with [`StepRecord::rayleigh`] it
+    /// satisfies r_i² + rotation_i² = ‖Ce_i‖₂² to rounding.
+    #[must_use]
+    pub fn rotations(&self) -> &[f64] {
+        &self.rotations
     }
 
     /// ‖Vᵀe_0‖₂, the degenerate-vector projection Remark 5 monitors. It is
@@ -659,6 +711,7 @@ pub fn run_tied<S: Fn() -> bool>(
         let update = (&coefficient * &embedding) * params.learning_rate;
         let relative_update = update.norm() / embedding.norm();
 
+        let action = coefficient_action(&spectrum, &coefficient);
         let record = StepRecord {
             step: steps,
             objective: system.objective(&embedding)?,
@@ -669,7 +722,9 @@ pub fn run_tied<S: Fn() -> bool>(
                 subspace_rank,
             )?,
             projections: eigenvector_projections(&spectrum, &embedding),
-            coefficient_norms: coefficient_norms(&spectrum, &coefficient),
+            coefficient_norms: action.norms,
+            rayleigh: action.rayleigh,
+            rotations: action.rotations,
         };
         write_tied_row(&mut sink, &record)?;
         records.push(record);
@@ -780,7 +835,8 @@ pub fn run_untied<S: Fn() -> bool>(
 }
 
 /// Writes the weight-tied header: the fixed columns followed by one
-/// `projection_i` and one `coefficient_norm_i` per vertex.
+/// `projection_i`, one `coefficient_norm_i`, one `rayleigh_i`, and one
+/// `rotation_i` per vertex.
 fn write_tied_header<W: Write>(sink: &mut W, order: usize) -> Result<()> {
     write!(sink, "step,objective,relative_update,observation8_residual")?;
     for i in 0..order {
@@ -788,6 +844,12 @@ fn write_tied_header<W: Write>(sink: &mut W, order: usize) -> Result<()> {
     }
     for i in 0..order {
         write!(sink, ",coefficient_norm_{i}")?;
+    }
+    for i in 0..order {
+        write!(sink, ",rayleigh_{i}")?;
+    }
+    for i in 0..order {
+        write!(sink, ",rotation_{i}")?;
     }
     writeln!(sink)?;
     Ok(())
@@ -801,7 +863,13 @@ fn write_tied_row<W: Write>(sink: &mut W, record: &StepRecord) -> Result<()> {
         "{},{},{},{}",
         record.step, record.objective, record.relative_update, record.observation8_residual
     )?;
-    for value in record.projections.iter().chain(&record.coefficient_norms) {
+    for value in record
+        .projections
+        .iter()
+        .chain(&record.coefficient_norms)
+        .chain(&record.rayleigh)
+        .chain(&record.rotations)
+    {
         write!(sink, ",{value}")?;
     }
     writeln!(sink)?;
@@ -1237,6 +1305,288 @@ mod tests {
             }
             other => panic!("expected EmbeddingShapeMismatch, got {other:?}"),
         }
+    }
+
+    /// Applied updates the split pins record over.
+    const SPLIT_STEPS: usize = 25;
+
+    /// Parameters for the split pins: a short run whose tolerance sits below
+    /// any relative update the loop produces, so it stops at the step limit
+    /// with `SPLIT_STEPS` + 1 recorded states.
+    fn split_params() -> Params {
+        Params {
+            dimension: 20,
+            max_steps: SPLIT_STEPS,
+            tolerance: 1e-300,
+            ..Params::default()
+        }
+    }
+
+    /// Bound on |r_i² + rotation_i² − ‖Ce_i‖₂²| over every tracked eigenvector
+    /// of every recorded step of the [`split_params`] runs. The measured
+    /// maximum over the four D-graphs, at seed 20260829, is 2.842e-14 against
+    /// squared norms reaching 16.2, so this leaves a factor of 35 over f64
+    /// rounding at that scale.
+    const PYTHAGOREAN_TOLERANCE: f64 = 1e-12;
+
+    /// Floor on the largest ‖Ce_i‖₂ a [`split_params`] run reaches, below
+    /// which the Pythagorean pin would hold on a collapsed C for free.
+    const PYTHAGOREAN_FLOOR: f64 = 0.1;
+
+    /// The recorded split is the orthogonal decomposition it claims to be:
+    /// r_i² + rotation_i² is ‖Ce_i‖₂² for every tracked eigenvector at every
+    /// recorded step of a short seeded run on each D-graph. A rotation
+    /// derived as `(‖Ce_i‖₂² − r_i²)^{1/2}` would satisfy this identity for
+    /// free; `c_shares_the_negative_laplacian_eigenpairs_at_initialization`
+    /// is the pin that rejects that substitution.
+    #[test]
+    fn the_coefficient_split_is_pythagorean_on_every_d_graph() {
+        let params = split_params();
+        let mut worst = 0.0_f64;
+        let mut worst_label = String::new();
+        let mut peak_norm = 0.0_f64;
+
+        for (name, graph) in d_graphs() {
+            let temp = TempPath::new("pythagoras");
+            let run =
+                run_tied(&graph, &params, SIGNATURE_SEED, temp.path(), || false).expect("run_tied");
+            assert_eq!(
+                run.records().len(),
+                SPLIT_STEPS + 1,
+                "{name}: the run recorded {} states, expected {} — the pin needs several \
+                 steps, not just the initial one",
+                run.records().len(),
+                SPLIT_STEPS + 1
+            );
+
+            for record in run.records() {
+                for i in 0..run.spectrum().order() {
+                    let norm = record.coefficient_norms()[i];
+                    let rayleigh = record.rayleigh()[i];
+                    let rotation = record.rotations()[i];
+                    let deviation = (rayleigh * rayleigh + rotation * rotation - norm * norm).abs();
+
+                    peak_norm = peak_norm.max(norm);
+                    if deviation > worst {
+                        worst = deviation;
+                        worst_label = format!("{name} eigenvector {i} at step {}", record.step());
+                    }
+                    assert!(
+                        deviation < PYTHAGOREAN_TOLERANCE,
+                        "{name}: at step {} eigenvector {i} has r_i = {rayleigh:.6e}, \
+                         rotation_i = {rotation:.6e}, ‖Ce_i‖₂ = {norm:.6e}; \
+                         |r_i² + rotation_i² − ‖Ce_i‖₂²| = {deviation:.6e}, tolerance \
+                         {PYTHAGOREAN_TOLERANCE:e}",
+                        record.step()
+                    );
+                }
+            }
+        }
+
+        assert!(
+            peak_norm > PYTHAGOREAN_FLOOR,
+            "the largest ‖Ce_i‖₂ over every recorded step is {peak_norm:.6e}, at or below the \
+             floor {PYTHAGOREAN_FLOOR}; on a collapsed C the identity holds for free"
+        );
+        println!(
+            "the_coefficient_split_is_pythagorean_on_every_d_graph: max \
+             |r_i² + rotation_i² − ‖Ce_i‖₂²| = {worst:.6e} at {worst_label}, \
+             largest ‖Ce_i‖₂ {peak_norm:.6e}"
+        );
+    }
+
+    /// Bound on |recorded − recomputed| for both split components at the
+    /// final recorded state. The measured maximum over the four D-graphs at
+    /// [`split_params`], seed 20260829, is 8.882e-16 against components
+    /// reaching 3.9, so this leaves three orders of magnitude.
+    const RECOMPUTATION_TOLERANCE: f64 = 1e-12;
+
+    /// Floor on the largest |r_i| the recomputation pin compares against.
+    const RECOMPUTATION_FLOOR: f64 = 0.1;
+
+    /// The recorded split is taken against e_i itself at the state the run
+    /// returns: C = (W − P) + (W − P)ᵀ recomputed from that embedding
+    /// reproduces every recorded r_i and rotation_i. The Pythagorean identity
+    /// above is insensitive to which unit vector the split is taken against —
+    /// splitting against e_{i+1} instead leaves it green — so this pin fixes
+    /// the index at the returned state, and
+    /// `every_recorded_split_matches_a_replayed_trajectory` fixes it at every
+    /// recorded step.
+    #[test]
+    fn the_recorded_split_matches_a_recomputation_from_c() {
+        let params = split_params();
+        let mut worst = 0.0_f64;
+        let mut worst_label = String::new();
+        let mut peak_rayleigh = 0.0_f64;
+
+        for (name, graph) in d_graphs() {
+            let temp = TempPath::new("recomputed-split");
+            let run =
+                run_tied(&graph, &params, SIGNATURE_SEED, temp.path(), || false).expect("run_tied");
+            let system = Node2Vec::new(&graph).expect("Node2Vec::new");
+            let coefficient = system.coefficient(run.embedding()).expect("coefficient");
+            let record = run.last().expect("a run records its initial state");
+
+            for i in 0..run.spectrum().order() {
+                let vector = run.spectrum().eigenvectors().column(i).into_owned();
+                let image = &coefficient * &vector;
+                let rayleigh = vector.dot(&image);
+                let rotation = (&image - &vector * rayleigh).norm();
+
+                peak_rayleigh = peak_rayleigh.max(rayleigh.abs());
+                for (component, recorded, recomputed) in [
+                    ("r", record.rayleigh()[i], rayleigh),
+                    ("rotation", record.rotations()[i], rotation),
+                ] {
+                    let deviation = (recorded - recomputed).abs();
+                    if deviation > worst {
+                        worst = deviation;
+                        worst_label = format!("{name} {component}_{i}");
+                    }
+                    assert!(
+                        deviation < RECOMPUTATION_TOLERANCE,
+                        "{name}: at step {} the recorded {component}_{i} is {recorded:.15}, \
+                         recomputing it from C at the returned embedding gives \
+                         {recomputed:.15} (|Δ| = {deviation:.6e}, tolerance \
+                         {RECOMPUTATION_TOLERANCE:e})",
+                        record.step()
+                    );
+                }
+            }
+        }
+
+        assert!(
+            peak_rayleigh > RECOMPUTATION_FLOOR,
+            "the largest |r_i| compared is {peak_rayleigh:.6e}, at or below the floor \
+             {RECOMPUTATION_FLOOR}; on a collapsed C the comparison is empty"
+        );
+        println!(
+            "the_recorded_split_matches_a_recomputation_from_c: max |recorded − recomputed| \
+             = {worst:.6e} at {worst_label}, largest |r_i| {peak_rayleigh:.6e}"
+        );
+    }
+
+    /// Every recorded step's split is taken against e_i: replaying the
+    /// trajectory from the seeded draw through the public gradient surface —
+    /// recompute C at the current embedding, compare the record, then apply
+    /// ΔV = ηCV — reproduces every r_i and rotation_i at every recorded
+    /// step. The final-state recomputation above cannot see a defect
+    /// confined to interior records; this pin can.
+    #[test]
+    fn every_recorded_split_matches_a_replayed_trajectory() {
+        let params = split_params();
+        let mut worst = 0.0_f64;
+        let mut worst_label = String::new();
+
+        for (name, graph) in d_graphs() {
+            let temp = TempPath::new("replayed-split");
+            let run =
+                run_tied(&graph, &params, SIGNATURE_SEED, temp.path(), || false).expect("run_tied");
+            let system = Node2Vec::new(&graph).expect("Node2Vec::new");
+            let mut embedding = system
+                .initial_embedding(&params, SIGNATURE_SEED)
+                .expect("initial_embedding");
+
+            for record in run.records() {
+                let coefficient = system.coefficient(&embedding).expect("coefficient");
+                for i in 0..run.spectrum().order() {
+                    let vector = run.spectrum().eigenvectors().column(i).into_owned();
+                    let image = &coefficient * &vector;
+                    let rayleigh = vector.dot(&image);
+                    let rotation = (&image - &vector * rayleigh).norm();
+
+                    for (component, recorded, recomputed) in [
+                        ("r", record.rayleigh()[i], rayleigh),
+                        ("rotation", record.rotations()[i], rotation),
+                    ] {
+                        let deviation = (recorded - recomputed).abs();
+                        if deviation > worst {
+                            worst = deviation;
+                            worst_label = format!("{name} {component}_{i} step {}", record.step());
+                        }
+                        assert!(
+                            deviation < RECOMPUTATION_TOLERANCE,
+                            "{name}: recorded {component}_{i} at step {} is {recorded:.15}, the \
+                             replayed trajectory gives {recomputed:.15} (|Δ| = {deviation:.6e}, \
+                             tolerance {RECOMPUTATION_TOLERANCE:e})",
+                            record.step()
+                        );
+                    }
+                }
+                embedding += (&coefficient * &embedding) * params.learning_rate;
+            }
+        }
+
+        println!(
+            "every_recorded_split_matches_a_replayed_trajectory: max |recorded − replayed| = \
+             {worst:.6e} at {worst_label}"
+        );
+    }
+
+    /// Bound on both Fact-1 deviations at initialization: rotation_i and
+    /// |r_i − λ_i| over every eigenvector of the four D-graphs. The measured
+    /// maxima at D7 defaults, seed 20260829, are 6.366e-15 and 3.553e-15, so
+    /// this leaves over two orders of magnitude.
+    const FACT1_TOLERANCE: f64 = 1e-12;
+
+    /// Fact 1 in the split coordinates: at the D7 initialization C(0) acts on
+    /// every eigenvector of −L as −L itself does. On each of the four
+    /// D-graphs the rotation component is zero to [`FACT1_TOLERANCE`], so
+    /// C(0) keeps −L's eigenvectors, and the Rayleigh component r_i is −L's
+    /// own eigenvalue λ_i to the same bound — including the eigenvectors
+    /// whose λ_i is far from zero, where r_i ≈ 0 would be the wrong claim.
+    #[test]
+    fn c_shares_the_negative_laplacian_eigenpairs_at_initialization() {
+        let params = Params {
+            max_steps: 1,
+            ..Params::default()
+        };
+        let mut worst_rotation = 0.0_f64;
+        let mut worst_drift = 0.0_f64;
+        let mut worst_label = String::new();
+
+        for (name, graph) in d_graphs() {
+            let temp = TempPath::new("fact1");
+            let run =
+                run_tied(&graph, &params, SIGNATURE_SEED, temp.path(), || false).expect("run_tied");
+            let record = &run.records()[0];
+            assert_eq!(
+                record.step(),
+                0,
+                "{name}: the first record is step {}, expected the initial state",
+                record.step()
+            );
+
+            for i in 0..run.spectrum().order() {
+                let eigenvalue = run.spectrum().eigenvalues()[i];
+                let rotation = record.rotations()[i];
+                let drift = (record.rayleigh()[i] - eigenvalue).abs();
+
+                if rotation > worst_rotation {
+                    worst_rotation = rotation;
+                    worst_label = format!("{name} eigenvector {i}");
+                }
+                worst_drift = worst_drift.max(drift);
+
+                assert!(
+                    rotation < FACT1_TOLERANCE,
+                    "{name}: at initialization Ce_{i} leaves e_{i} by {rotation:.6e}, tolerance \
+                     {FACT1_TOLERANCE:e} (‖Ce_{i}‖₂ = {:.6e}, λ_{i} = {eigenvalue:.6})",
+                    record.coefficient_norms()[i]
+                );
+                assert!(
+                    drift < FACT1_TOLERANCE,
+                    "{name}: at initialization r_{i} = {:.15}, λ_{i} = {eigenvalue:.15}, \
+                     |r_i − λ_i| = {drift:.6e}, tolerance {FACT1_TOLERANCE:e}",
+                    record.rayleigh()[i]
+                );
+            }
+        }
+
+        println!(
+            "c_shares_the_negative_laplacian_eigenpairs_at_initialization: max rotation \
+             {worst_rotation:.6e} at {worst_label}, max |r_i − λ_i| {worst_drift:.6e}"
+        );
     }
 
     /// Seed shared by the signature pins.

@@ -3,9 +3,11 @@
 //! One weight-tied run per graph at the decision-D7 defaults, each streaming
 //! its per-step record to `<SETTINGS.output.dir>/tier1_fig9_<graph>.csv`: the
 //! eigenvector projections ‖Vᵀe_i‖₂ (panel b left/middle), the coefficient
-//! norms ‖Ce_i‖₂ (panel b right), the objective, the Observation-8 residual,
-//! and the Remark-5 degenerate projection in column `projection_0`. The runs
-//! are synchronous numerics, so the `Runner` job hands them to
+//! norms ‖Ce_i‖₂ (panel b right) with their orthogonal split into the signed
+//! Rayleigh component r_i = e_iᵀCe_i and the rotation ‖Ce_i − r_i e_i‖₂, the
+//! objective, the Observation-8 residual, and the Remark-5 degenerate
+//! projection in column `projection_0`. The runs are synchronous numerics,
+//! so the `Runner` job hands them to
 //! `spawn_blocking` and polls its child token between steps; ctrl-c drains
 //! through `Runner::shutdown` and leaves complete CSV rows. The output
 //! directory and seed come from `SETTINGS` here and reach the library as
