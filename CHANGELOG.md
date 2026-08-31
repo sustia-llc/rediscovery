@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The coefficient norm's Rayleigh/rotation split in `node2vec`'s per-step
+  record and history CSV (#7): per tracked eigenvector of −L, the signed
+  Rayleigh component r_i = e_iᵀCe_i and the perpendicular rotation norm
+  ‖Ce_i − r_i e_i‖₂, each computed from Ce_i directly, appended as
+  `rayleigh_i`/`rotation_i` columns. Five falsified pins: the Pythagorean
+  identity (measured deviation 2.8e-14 against a 1e-12 tolerance),
+  final-state and per-step recomputations that fix the eigenvector index at
+  every recorded step — which the Pythagorean identity alone cannot,
+  holding as it does against any unit vector — the C(0) = −L eigenpair
+  identity, and the CSV round-trip over the new columns. The split separates the two failure modes Appendix F.2
+  conflates; the per-eigenvector tables it produced on the irregular and
+  cycle Fig-9 runs are recorded on issue #7.
 - `tinynn::Moments` — one block's decoupled-AdamW moment state and its
   `advance` step — is public, so downstream steppers outside `tinynn::run`
   can use this crate's §B.3 reading (requested downstream, PR #10). Fields
@@ -23,6 +35,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and adjacency membership over all 92 fixture rows, the degree count on
   every fixture, the empty row, and the out-of-range rejection with its
   payload.
+
+### Findings (Tier 1)
+
+- **Correction to a 0.1.0 Findings sentence, measured by the #7 split:**
+  "Both quantities are exactly zero at initialization" holds only where
+  λ_i itself vanishes. At the committed knobs over the four D-graphs the
+  initial rotation component is ≤ 6.4e-15 while the initial Rayleigh
+  component equals λ_i to 3.6e-15 — C(0) = −L on every eigenpair of those
+  four graphs, the stronger reading of Fact 1 (pinned by
+  `c_shares_the_negative_laplacian_eigenpairs_at_initialization`). The
+  0.1.0 sentence's 4.8e-15, and the 99.6 % rotation share behind
+  Proposition 7's failure, are both located by the split's measured
+  tables, recorded on issue #7 at the landing.
 
 ### Findings (Tier 2)
 
