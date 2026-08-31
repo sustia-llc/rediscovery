@@ -945,8 +945,15 @@ pub fn scheduled_rate(step: usize, budget: usize, peak: f64, fraction: f64) -> f
 }
 
 /// One block's decoupled-AdamW moment state.
+///
+/// Public so that downstream consumers stepping outside [`run`] — an online
+/// learner taking per-transition steps, say — use this crate's §B.3 reading
+/// instead of re-deriving it. The ordering subtleties are easy to get wrong
+/// in a re-derivation: here the decay multiplies the *stepped* value (see
+/// [`Moments::advance`]), not the pre-step parameter, and never passes
+/// through the moments.
 #[derive(Debug, Clone)]
-struct Moments {
+pub struct Moments {
     first: DMatrix<f64>,
     second: DMatrix<f64>,
     updates: i32,
@@ -954,7 +961,8 @@ struct Moments {
 
 impl Moments {
     /// Zero moments shaped like the block they track.
-    fn zeros(rows: usize, columns: usize) -> Self {
+    #[must_use]
+    pub fn zeros(rows: usize, columns: usize) -> Self {
         Self {
             first: DMatrix::zeros(rows, columns),
             second: DMatrix::zeros(rows, columns),
@@ -968,7 +976,7 @@ impl Moments {
     ///
     /// The decay reaches the parameter without passing through `gradient`, so
     /// the moments track the loss gradient alone.
-    fn advance(
+    pub fn advance(
         &mut self,
         parameter: &DMatrix<f64>,
         gradient: &DMatrix<f64>,
@@ -1427,6 +1435,44 @@ mod tests {
             .num_threads(SWEEP_THREADS)
             .build()
             .expect("a rayon pool of SWEEP_THREADS workers")
+    }
+
+    /// A zero-gradient [`Moments::advance`] moves the parameter by the
+    /// decoupled decay alone and leaves both moments untouched — the
+    /// property separating §B.3's AdamW from Adam-with-L2, and the
+    /// contract the public exposure of [`Moments`] pins for external
+    /// steppers.
+    #[test]
+    fn a_zero_gradient_advance_is_pure_decoupled_decay() {
+        let parameter = DMatrix::from_fn(3, 4, |i, j| 0.5 + (4 * i + j) as f64);
+        let gradient = DMatrix::zeros(3, 4);
+        let settings = AdamW::default();
+        let rate = 0.01;
+        let mut moments = Moments::zeros(3, 4);
+
+        let movement = moments.advance(&parameter, &gradient, rate, settings);
+
+        let decay = rate * settings.weight_decay;
+        for i in 0..3 {
+            for j in 0..4 {
+                let expected = parameter[(i, j)] * decay;
+                assert!(
+                    (movement[(i, j)] - expected).abs() <= 1e-15 * parameter[(i, j)].abs(),
+                    "movement ({i}, {j}) must be the decoupled decay alone: {} vs {expected}",
+                    movement[(i, j)]
+                );
+            }
+        }
+        assert_eq!(
+            moments.first,
+            DMatrix::zeros(3, 4),
+            "a zero gradient leaves the first moment zero"
+        );
+        assert_eq!(
+            moments.second,
+            DMatrix::zeros(3, 4),
+            "a zero gradient leaves the second moment zero"
+        );
     }
 
     /// A unique path under the system temp directory, removed on drop.
