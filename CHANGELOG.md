@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Findings (Tier 2)
+
+- **The W-initialization flip is graph-dependent.** The committed finding
+  — no Gaussian-initialized learnable run crosses the 0.75 criterion in
+  20 000 steps at any ρ — holds on the four D-graphs, `grid(4, 4)` among
+  them, and does not extend unmodified to larger members of the same
+  family: on `grid(6, 8)` at the committed width 512, η = 0.01, ρ = 1,
+  seed 20260829, the Gaussian-initialized run peaks at alignment
+  **0.8160584913387996** within a 2 000-step budget — above the
+  criterion. First observed downstream in
+  [`spatial-priors`](https://github.com/sustia-llc/spatial-priors)
+  (finding F15, 2026-08-31); reproduced with this crate's own run loop
+  and pinned in `tests/tier2_flip_scope.rs`. The initializer decides the
+  geometry on the committed graphs; which graphs the dichotomy covers is
+  its own open question.
+
 ## [0.1.0] - 2026-08-31
 
 ### Changed
