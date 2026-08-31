@@ -946,12 +946,8 @@ pub fn scheduled_rate(step: usize, budget: usize, peak: f64, fraction: f64) -> f
 
 /// One block's decoupled-AdamW moment state.
 ///
-/// Public so that downstream consumers stepping outside [`run`] — an online
-/// learner taking per-transition steps, say — use this crate's §B.3 reading
-/// instead of re-deriving it. The ordering subtleties are easy to get wrong
-/// in a re-derivation: here the decay multiplies the *stepped* value (see
-/// [`Moments::advance`]), not the pre-step parameter, and never passes
-/// through the moments.
+/// The decay multiplies the *stepped* value (see [`Moments::advance`]), not
+/// the pre-step parameter, and never passes through the moments.
 #[derive(Debug, Clone)]
 pub struct Moments {
     first: DMatrix<f64>,
@@ -976,6 +972,12 @@ impl Moments {
     ///
     /// The decay reaches the parameter without passing through `gradient`, so
     /// the moments track the loss gradient alone.
+    ///
+    /// # Panics
+    ///
+    /// Panics inside nalgebra when `parameter`, `gradient` and the moments do
+    /// not share one shape; [`Moments::zeros`] sets the shape the moments
+    /// track.
     pub fn advance(
         &mut self,
         parameter: &DMatrix<f64>,
@@ -1438,10 +1440,12 @@ mod tests {
     }
 
     /// A zero-gradient [`Moments::advance`] moves the parameter by the
-    /// decoupled decay alone and leaves both moments untouched — the
-    /// property separating §B.3's AdamW from Adam-with-L2, and the
-    /// contract the public exposure of [`Moments`] pins for external
-    /// steppers.
+    /// decoupled decay alone and leaves both moments exactly zero — the
+    /// property separating §B.3's AdamW from Adam-with-L2. The decay's
+    /// placement on the stepped value is pinned by
+    /// `a_nonzero_gradient_advance_decays_the_stepped_value`, which a
+    /// zero gradient cannot see (the two placements differ by the decay of
+    /// the step, and a zero gradient makes the step zero).
     #[test]
     fn a_zero_gradient_advance_is_pure_decoupled_decay() {
         let parameter = DMatrix::from_fn(3, 4, |i, j| 0.5 + (4 * i + j) as f64);
@@ -1472,6 +1476,44 @@ mod tests {
             moments.second,
             DMatrix::zeros(3, 4),
             "a zero gradient leaves the second moment zero"
+        );
+    }
+
+    /// A non-zero-gradient first [`Moments::advance`] decays the *stepped*
+    /// value: the movement equals step + λ(parameter − step) against a
+    /// hand reference (first update from zero moments, so the bias-corrected
+    /// step is η·g/(|g| + ε)), which the pre-step placement — movement
+    /// step + λ·parameter — misses by λ·step, far above the tolerance.
+    #[test]
+    fn a_nonzero_gradient_advance_decays_the_stepped_value() {
+        let parameter = DMatrix::from_fn(3, 4, |i, j| 0.5 + (4 * i + j) as f64);
+        let gradient = DMatrix::from_fn(3, 4, |i, j| 0.25 - ((i + 3 * j) as f64) * 0.125);
+        let settings = AdamW::default();
+        let rate = 0.01;
+        let mut moments = Moments::zeros(3, 4);
+
+        let movement = moments.advance(&parameter, &gradient, rate, settings);
+
+        let decay = rate * settings.weight_decay;
+        for i in 0..3 {
+            for j in 0..4 {
+                let g = gradient[(i, j)];
+                let step = rate * g / (g.abs() + settings.epsilon);
+                let expected = step + decay * (parameter[(i, j)] - step);
+                assert!(
+                    (movement[(i, j)] - expected).abs() <= 1e-12,
+                    "movement ({i}, {j}) must decay the stepped value: {} vs {expected} \
+                     (pre-step placement would give {})",
+                    movement[(i, j)],
+                    step + decay * parameter[(i, j)]
+                );
+            }
+        }
+        assert_ne!(
+            moments.first,
+            DMatrix::zeros(3, 4),
+            "a non-zero gradient must move the first moment, or the reference above \
+             degenerates to the zero-gradient case"
         );
     }
 

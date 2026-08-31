@@ -10,14 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `tinynn::Moments` — one block's decoupled-AdamW moment state and its
-  `advance` step — is public, so downstream consumers stepping outside
-  `tinynn::run` (an online learner taking per-transition steps, say) use
-  this crate's §B.3 reading instead of re-deriving it. Motivated by
-  `spatial-priors`, whose hand-rolled re-derivation differed subtly in
-  decay placement (decay of the pre-step parameter, against this crate's
-  decay of the stepped value). Behavior unchanged; the decoupling —
-  a zero-gradient advance moves the parameter by decay alone and leaves
-  the moments untouched — is pinned in the lib tests.
+  `advance` step — is public, so downstream steppers outside `tinynn::run`
+  can use this crate's §B.3 reading (requested downstream, PR #10). Fields
+  stay private; behavior unchanged — the diff moves visibility and docs
+  only. The decay's placement on the *stepped* value is pinned by a
+  non-zero-gradient advance against a hand reference, and a zero-gradient
+  advance moves the parameter by the decay alone with both moments exactly
+  zero.
 - `Graph::neighbors` — a vertex's adjacent indices in ascending order,
   with a new `Error::VertexOutOfBounds` for an out-of-range vertex
   (requested downstream, PR #11). Pinned by hand-known rows, strict ascent
