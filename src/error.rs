@@ -25,7 +25,7 @@ pub enum Error {
     #[error("edge ({u}, {v}) leaves the vertex range of a {order}-vertex graph")]
     EdgeOutOfBounds { u: usize, v: usize, order: usize },
 
-    #[error("vertex {vertex} leaves the range of a {order}-vertex graph")]
+    #[error("vertex {vertex} leaves the vertex range of a {order}-vertex graph")]
     VertexOutOfBounds { vertex: usize, order: usize },
 
     #[error("self-loop at vertex {vertex}: graphs in this crate are loop-free")]

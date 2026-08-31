@@ -10,11 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `Graph::neighbors` — a vertex's adjacent indices in ascending order,
-  with a new `Error::VertexOutOfBounds` for an out-of-range vertex.
-  Downstream consumers that walk the graph rather than multiply by it
-  (`spatial-priors` rebuilt these lists from the dense adjacency) get the
-  row as indices directly. Pinned by hand-known rows, the degree count on
-  every fixture, and the out-of-range rejection.
+  with a new `Error::VertexOutOfBounds` for an out-of-range vertex
+  (requested downstream, PR #11). Pinned by hand-known rows, strict ascent
+  and adjacency membership over all 92 fixture rows, the degree count on
+  every fixture, the empty row, and the out-of-range rejection with its
+  payload.
 
 ### Findings (Tier 2)
 

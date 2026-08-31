@@ -271,12 +271,17 @@ impl Graph {
     }
 
     /// The vertices adjacent to `vertex`, in ascending order — the
-    /// adjacency row as indices, for consumers that walk the graph rather
-    /// than multiply by it.
+    /// adjacency row as indices.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::VertexOutOfBounds`] when `vertex` is not a vertex.
+    /// Returns [`Error::VertexOutOfBounds`] when `vertex` is at or beyond
+    /// the order.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "degrees hold small vertex counts, exact and non-negative in f64"
+    )]
     pub fn neighbors(&self, vertex: usize) -> Result<Vec<usize>> {
         if vertex >= self.order() {
             return Err(Error::VertexOutOfBounds {
@@ -284,9 +289,13 @@ impl Graph {
                 order: self.order(),
             });
         }
-        Ok((0..self.order())
-            .filter(|&other| self.adjacency[(vertex, other)] > 0.0)
-            .collect())
+        let mut neighbors = Vec::with_capacity(self.degrees[vertex] as usize);
+        for other in 0..self.order() {
+            if self.adjacency[(vertex, other)] > 0.0 {
+                neighbors.push(other);
+            }
+        }
+        Ok(neighbors)
     }
 }
 
@@ -342,8 +351,9 @@ mod tests {
     use super::*;
 
     /// `neighbors` lists each vertex's adjacent indices in ascending
-    /// order: pinned by hand on known rows, by the degree count on every
-    /// fixture, and rejected out of range.
+    /// order: pinned by hand on known rows, by strict ascent, adjacency
+    /// membership and the degree count over every fixture row, by the
+    /// empty row, and by the out-of-range rejection with its payload.
     #[test]
     fn neighbors_list_the_adjacency_row_ascending() {
         let cycle = Graph::cycle(15).expect("cycle(15)");
@@ -361,16 +371,44 @@ mod tests {
                     graph.degrees()[vertex],
                     "{label}, vertex {vertex}: the neighbor count is the degree"
                 );
+                assert!(
+                    neighbors.windows(2).all(|pair| pair[0] < pair[1]),
+                    "{label}, vertex {vertex}: {neighbors:?} is not strictly ascending"
+                );
+                for &other in &neighbors {
+                    assert_eq!(
+                        graph.adjacency()[(vertex, other)],
+                        1.0,
+                        "{label}, vertex {vertex}: listed {other}, A[{vertex},{other}] = {}",
+                        graph.adjacency()[(vertex, other)]
+                    );
+                }
             }
         }
 
-        assert!(matches!(
-            cycle.neighbors(15),
-            Err(Error::VertexOutOfBounds {
-                vertex: 15,
-                order: 15
-            })
-        ));
+        let lone = Graph::complete(1).expect("complete(1)");
+        assert_eq!(
+            lone.neighbors(0).expect("vertex 0"),
+            Vec::<usize>::new(),
+            "the one-vertex graph's only row is empty"
+        );
+
+        for (vertex, order) in [(15_usize, 15_usize), (99, 15)] {
+            match cycle.neighbors(vertex) {
+                Err(Error::VertexOutOfBounds {
+                    vertex: seen,
+                    order: seen_order,
+                }) => {
+                    assert_eq!(
+                        (seen, seen_order),
+                        (vertex, order),
+                        "the rejection names vertex {seen} of {seen_order}, expected {vertex} \
+                         of {order}"
+                    );
+                }
+                other => panic!("expected VertexOutOfBounds for vertex {vertex}, got {other:?}"),
+            }
+        }
     }
 
     /// D1–D4 vertex counts, plus the edge count each topology implies.
