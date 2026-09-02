@@ -32,7 +32,14 @@ under §B.3's AdamW-with-schedule; those runs memorize the edges instead.
 §B.2.2 does not state the paper's initializer. Beyond the D-graphs the
 boundary is not settled: on a 6×8 grid at the same knobs, one committed seed
 crosses the criterion at step 77 while the other stays below it (see
-Findings in the changelog). The two-run demonstration:
+Findings in the changelog). And the boundary has a third axis, scale: on
+the circulant C_n(1, 2) at n = 50–1000 under row-sampled SGD, no run of
+either initializer crosses at any order — peak alignment falls as ≈ 18/n
+with W(0) = I against ≈ 11/n with Gaussian W(0), a persistent ratio that
+never becomes a dichotomy — and the criterion itself cannot separate
+fitted models at large n, since a model that fits D⁻¹A carries all n
+harmonics and the Fiedler pair's share of its variance is Θ(1/n) (see
+Findings; measured downstream in sparse-priors). The two-run demonstration:
 
 ```sh
 cargo run --release --example w_init_flip
