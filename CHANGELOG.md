@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Findings (Tier 2)
+
+- **The W-initialization flip is scale-bound, and the alignment
+  criterion does not transport across scale.** On the circulant
+  C_n(1, 2) — the ring with two neighbors per side, degree 4 — at
+  n ∈ {50, 100, 200, 500, 1000}, width 512, η = 0.01, ρ = 1, four seeds
+  per arm, under row-sampled SGD (batches of 32 rows over a seeded epoch
+  permutation, gradients summed so one epoch applies one full-batch
+  gradient's movement, sequenced; 300 epochs): **no run of either
+  initializer crosses the 0.75 criterion at any order**, including
+  n = 50, whose Fiedler gap (0.079) sits inside the D-graphs' range.
+  Peak alignment follows a power law — identity ≈ 18/n
+  (0.364 → 0.19 → 0.10 → 0.04 over 50 → 500, extrapolating to the
+  measured 0.020–0.022 at 1000), Gaussian ≈ 11/n (0.013–0.014 at
+  1000) — so the flip survives as a persistent ×1.6 identity advantage
+  and never as a dichotomy; the Gaussian arm converges to the lower loss
+  at every order (n = 50: 70.7 vs 96.0 against the 69.3
+  uniform-over-neighbors floor). The instrument caveat is the sharper
+  half: a model that fits D⁻¹A must carry all n harmonics in its
+  embedding, so the Fiedler pair's variance share — what
+  `fiedler_alignment` measures — is Θ(1/n) for *any* converged model,
+  and the absolute threshold separates fitted models only where n is
+  small enough for two harmonics to dominate; the reference geometries
+  it was calibrated against pass at any n and do not reveal this.
+  Scale-invariant companions — the ratio to the random floor
+  (≈ 2/(n − 1) for a pair), or per-harmonic energy against the analytic
+  spectrum — are what carried the downstream project past n = 10³.
+  Measured downstream (sparse-priors v0.1.0, findings S1–S2), under an
+  optimizer that differs from this crate's full-batch runner, so the
+  upstream falsification is `w_init_flip`'s own machinery on
+  `cycle(50)` and `cycle(100)` with the identity initializer at the
+  20 000-step budget: a crossing there narrows this note from scale to
+  budget-under-sampling.
+
 ## [0.2.0] - 2026-08-31
 
 ### Added
